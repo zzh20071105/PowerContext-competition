@@ -247,6 +247,11 @@ class CompositeMemoryIndex:
         request: MemorySearchRequest,
         /,
     ) -> MemorySearchChannels:
+        if request.mode == "hybrid":
+            for index in self.indexes:
+                hybrid_search = getattr(index, "hybrid_search", None)
+                if callable(hybrid_search):
+                    return await hybrid_search(connection, scope_id, request)
         fts: tuple[MemoryChannelHit, ...] = ()
         vector: tuple[MemoryChannelHit, ...] = ()
         for index in self.indexes:
