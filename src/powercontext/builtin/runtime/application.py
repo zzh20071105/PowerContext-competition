@@ -3149,8 +3149,28 @@ class BuiltinRuntime:
 
         async def lifecycle_aware_topic_search(scope_id: str, query: str, /, **kwargs: Any):
             result = await search(scope_id, query, **kwargs)
-            withdrawn = await withdrawn_topic_artifact_ids(self._provider.database, scope_id)
-            if not withdrawn or not result.hits:
+            # Test doubles may provide callables without a relational provider; without
+            # lifecycle storage the filter is a no-op, and a failing lookup must never
+            # take Topic search down with it.
+            database = getattr(self._provider, "database", None)
+            if database is None or not result.hits:
+                return result
+            try:
+                withdrawn = await withdrawn_topic_artifact_ids(database, scope_id)
+            except Exception as error:
+                log_safely(
+                    logger,
+                    logging.WARNING,
+                    "Topic Memory lifecycle filter lookup failed",
+                    exc_info=error,
+                    extra={
+                        "event": "topic_memory.lifecycle_filter_failed",
+                        "outcome": "failure",
+                        "unit": "topic-memory",
+                    },
+                )
+                return result
+            if not withdrawn:
                 return result
             return result.model_copy(
                 update={

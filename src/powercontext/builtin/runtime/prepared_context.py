@@ -325,14 +325,21 @@ class PreparedContextBuilder:
         scored = _rank_evidence_spans(request.query, memory_candidates)
         selected: list[_ScoredSpan] = []
         rendered_items: list[dict[str, object]] = []
+        # Exact incremental accounting of the envelope bytes: every accepted item adds
+        # its serialized JSON plus one comma separator, so each budget check is O(item)
+        # instead of re-rendering the whole envelope per candidate.
+        fixed_bytes = _FRAGMENT_ENVELOPE_FIXED_BYTES
+        items_bytes = 0
         for span in scored:
-            candidate_items = [*rendered_items, _fragment_item(span)]
-            content = _render_fragment_envelope(candidate_items)
-            if len(content.encode("utf-8")) > request.max_bytes:
+            item = _fragment_item(span)
+            item_bytes = len(json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            candidate_bytes = fixed_bytes + items_bytes + item_bytes + (0 if not rendered_items else 1)
+            if candidate_bytes > request.max_bytes:
                 # Keep trying later (possibly shorter) spans so the byte budget
                 # still fills with relevant evidence instead of stopping early.
                 continue
-            rendered_items = candidate_items
+            rendered_items.append(item)
+            items_bytes = candidate_bytes - fixed_bytes
             selected.append(span)
             if len(selected) >= self.entry_limit * 4:
                 break
@@ -841,6 +848,21 @@ def _render_fragment_envelope(items: Sequence[dict[str, object]]) -> str:
     }
     encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
     return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+
+
+# Byte length of one rendered fragment envelope holding zero items; the incremental
+# budget check adds each item's serialized JSON plus a comma to this exact base.
+_FRAGMENT_ENVELOPE_FIXED_BYTES = len(
+    "\n\n".join(
+        (
+            TRUST_POLICY,
+            f"{_BEGIN_MARKER}\n"
+            + '{"trust":"untrusted_history","items":['
+            + "]}"
+            + f"\n{_END_MARKER}",
+        )
+    ).encode("utf-8")
+)
 
 
 def _interleave_groups(groups: Sequence[Sequence[_Item]]) -> tuple[_Item, ...]:

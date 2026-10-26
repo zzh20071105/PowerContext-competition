@@ -219,13 +219,17 @@ class ScopedSourceLifecycleService:
         """Return the bound reference for generation or audit use."""
 
         if purpose not in _PURPOSES:
-            raise SourceLifecycleError(f"unknown lifecycle purpose {purpose!r}")  # noqa: TRY003
-        nodes = await self._load_nodes()
-        node = next((item for item in nodes if item.node_id == node_id), None)
+            message = f"unknown lifecycle purpose {purpose!r}"
+            raise SourceLifecycleError(message)
+        database = self._runtime._provider.database
+        async with database.transaction() as connection:
+            node = await _load_row(connection, self.scope_id, node_id)
         if node is None:
-            raise SourceLifecycleError(f"unknown lifecycle node {node_id!r}")  # noqa: TRY003
+            message = f"unknown lifecycle node {node_id!r}"
+            raise SourceLifecycleError(message)
         if purpose == "generation" and not node.available:
-            raise SourceLifecycleError(f"lifecycle node {node_id!r} is withdrawn from generation use")  # noqa: TRY003
+            message = f"lifecycle node {node_id!r} is withdrawn from generation use"
+            raise SourceLifecycleError(message)
         if node.kind == KIND_SOURCE:
             return SourceRef.model_validate(node.ref)
         if node.kind == KIND_MEMORY:
