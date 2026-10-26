@@ -47,6 +47,7 @@ else:
     from multiprocessing.popen_spawn_posix import Popen as SpawnPopen
 
 from powercontext._logging import log_safely
+from powercontext.builtin.persistence.cursors import SourceCursorRepository
 from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.errors import ArtifactProcessingLeadershipLostError
 from powercontext.builtin.persistence.processing_intents import ArtifactProcessingIntentRepository
@@ -57,7 +58,11 @@ from powercontext.builtin.persistence.supervision import (
     ArtifactProcessingLeaseRepository,
     database_utc_now,
 )
-from powercontext.builtin.persistence.tables import ARTIFACT_PROCESSING_INTENTS_TABLE, ARTIFACT_PROCESSING_LEASES_TABLE
+from powercontext.builtin.persistence.tables import (
+    ARTIFACT_PROCESSING_INTENTS_TABLE,
+    ARTIFACT_PROCESSING_LEASES_TABLE,
+    SOURCE_JOURNAL_HEADS_TABLE,
+)
 from powercontext.builtin.runtime.processing_contracts import (
     ArtifactProcessingWorkAssignment,
     ArtifactProcessingWorkerCompletion,
@@ -110,6 +115,9 @@ class ArtifactProcessingBinding:
     max_workers: int = 1
     worker_timeout_seconds: float = 600.0
     automatic_processing_interval: timedelta | None = None
+    # Count admission: request one invocation once a scope holds at least this many
+    # journal entries beyond the Family cursor; OR-combined with the interval.
+    count_threshold: int | None = None
     cron: str | None = None
     timezone: str = "Asia/Shanghai"
     config_prefix: str | None = None
@@ -136,6 +144,8 @@ class ArtifactProcessingBinding:
                 raise ValueError("automatic interval must be positive")  # noqa: TRY003
             if self.cron is not None:
                 raise ValueError("interval and cron cannot both be enabled")  # noqa: TRY003
+        if self.count_threshold is not None and (type(self.count_threshold) is not int or self.count_threshold < 1):
+            raise ValueError("count_threshold must be a positive integer")  # noqa: TRY003
         if self.cron is not None:
             CronTrigger.from_crontab(self.cron, timezone=ZoneInfo(self.timezone))
 
@@ -994,7 +1004,9 @@ class ArtifactProcessingSupervisor:
                     )
                 state.retries.pop(scope, None)
                 state.completed += 1
-                if row.requested_generation > row.handled_generation:
+                if await self._maybe_request_count_admission(state, scope):
+                    self.wake(state.binding.binding_name)
+                elif row.requested_generation > row.handled_generation:
                     self.wake(state.binding.binding_name)
             except (ArtifactProcessingLeadershipLostError, _WorkerTerminationError):
                 # Retain the slot until the old term is revoked and all children are reaped.
@@ -1015,6 +1027,20 @@ class ArtifactProcessingSupervisor:
                 if not retain_slot:
                     state.running.pop(scope, None)
                     self.wake(state.binding.binding_name)
+
+    async def _maybe_request_count_admission(self, state: _FamilyState, scope: str, /) -> bool:
+        """Request the next invocation when remaining entries still reach the count gate."""
+
+        threshold = state.binding.count_threshold
+        if threshold is None:
+            return False
+        async with self._database.transaction() as connection:
+            await self._leases.require_fence(connection, self._require_current_fence())
+            pending = await scope_pending_count(connection, scope, state.binding.binding_name)
+            if pending < threshold:
+                return False
+            await self._intents.request(connection, scope, state.binding.binding_name)
+        return True
 
     async def _lose_leadership(self) -> None:
         fence, self._fence = self._fence, None
@@ -1194,6 +1220,17 @@ class ArtifactProcessingSupervisors:
 
     async def close(self) -> None:
         await asyncio.gather(*(item.close() for item in self.supervisors))
+
+
+async def scope_pending_count(connection: AsyncConnection, scope_id: str, binding_name: str, /) -> int:
+    """Count journal identities beyond one Family's last successfully committed cursor."""
+
+    high = await connection.scalar(select(SOURCE_JOURNAL_HEADS_TABLE.c.position).where(
+        SOURCE_JOURNAL_HEADS_TABLE.c.scope_id == scope_id
+    ))
+    cursor = await SourceCursorRepository().load(connection, scope_id, binding_name)
+    cursor_sequence = 0 if cursor is None else cursor.cursor.sequence
+    return (0 if high is None else int(high)) - cursor_sequence
 
 
 def _run_spawned_worker(

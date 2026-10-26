@@ -201,12 +201,16 @@ class RuntimeConfig(BaseModel):
 
     schedule_seconds: float | None = Field(default=None, gt=0)
     memory_schedule_seconds: float | None = Field(default=None, gt=0)
+    # Count admission: start one original processing call once a scope family has at
+    # least this many unprocessed journal entries; OR-combined with the schedule.
+    memory_source_count_threshold: int | None = Field(default=None, ge=1, strict=True)
     experience_schedule_seconds: float | None = Field(default=None, gt=0)
     dream_enabled: bool = True
     dream_max_pending_per_scope: int = Field(default=32, ge=1, le=1000)
     generation_concurrency: int = Field(default=4, ge=1, le=64)
     dream_budget: DreamBudget = Field(default_factory=DreamBudget)
     topic_memory_schedule_seconds: float | None = Field(default=None, gt=0)
+    topic_memory_source_count_threshold: int | None = Field(default=None, ge=1, strict=True)
     topic_memory_source_window_limit: int = Field(default=10, ge=1)
     topic_memory_history_max_candidates: int = Field(default=20, ge=1, le=MAX_TOPIC_MEMORY_SEARCH_LIMIT)
     topic_memory_history_rrf_threshold: int = Field(default=70, ge=0, le=100)

@@ -127,6 +127,7 @@ from powercontext.builtin.runtime.artifact_processing import (
     SpawnArtifactProcessingWorkerLauncher,
 )
 from powercontext.builtin.runtime.config import BuiltinConfig, ExternalSkillsConfig, InferenceConfig, RuntimeConfig
+from powercontext.builtin.triggers import SOURCE_WINDOW_TRIGGER_NAME
 from powercontext.builtin.runtime.decision_model import (
     DECISION_INSTRUCTIONS,
     DecisionInput,
@@ -483,6 +484,7 @@ async def open_builtin_runtime(
             if external_skill_provider is None
             else external_skill_provider
         )
+        count_wake = CountAdmissionWake()
         contexts = await resources.enter_async_context(
             open_builtin_contexts(
                 config,
@@ -503,6 +505,7 @@ async def open_builtin_runtime(
                 prompt_registry=prompt_registry,
                 prompt_demonstrators=prompt_demonstrators,
                 handoff_verification_keys=handoff_verification_keys,
+                on_count_request=count_wake,
             )
         )
         contexts.profiles.generator = generated_profile if profile_generator is None else profile_generator
@@ -656,6 +659,7 @@ async def open_builtin_runtime(
         runtime.artifact_processing_supervisor = await resources.enter_async_context(
             _open_artifact_processing_supervisor(config, contexts, processing_bindings, tracing=tracing)
         )
+        count_wake.bind(runtime.artifact_processing_supervisor)
         contexts.profiles.operation_context = runtime._operation
         if config.handoff_report.enabled:
             runtime.handoff_report = HandoffReportApplication(
@@ -779,6 +783,13 @@ def _artifact_processing_bindings(  # noqa: C901 - validate and assemble one reg
                 max_workers=getattr(config.runtime, f"{prefix}_max_workers"),
                 worker_timeout_seconds=getattr(config.runtime, f"{prefix}_worker_timeout_seconds"),
                 automatic_processing_interval=None if interval is None else timedelta(seconds=float(interval)),
+                count_threshold=(
+                    config.runtime.memory_source_count_threshold
+                    if family == "memory"
+                    else config.runtime.topic_memory_source_count_threshold
+                    if family == "topic-memory"
+                    else None
+                ),
                 cron=config.runtime.profile_cron
                 if family == "profile" and config.runtime.profile_schedule_enabled
                 else None,
@@ -817,6 +828,48 @@ def _topic_memory_provider_available(config: BuiltinConfig) -> bool:
     except BuiltinConfigurationError:
         return False
     return True
+
+
+class CountAdmissionWake:
+    """Late-bound, best-effort wake from count admission to the live Supervisors."""
+
+    def __init__(self) -> None:
+        self._supervisors: ArtifactProcessingSupervisors | None = None
+
+    def bind(self, supervisors: ArtifactProcessingSupervisors | None) -> None:
+        self._supervisors = supervisors
+
+    def __call__(self, binding_name: str) -> None:
+        supervisors = self._supervisors
+        if supervisors is None:
+            return
+        try:
+            supervisors.wake(binding_name)
+        except Exception as error:
+            log_safely(
+                logger,
+                logging.WARNING,
+                "Count admission supervisor wake failed",
+                exc_info=error,
+                extra={
+                    "event": "artifact_processing.count_wake_failed",
+                    "outcome": "failure",
+                    "unit": "artifact",
+                },
+            )
+
+
+def _source_count_admissions(runtime: RuntimeConfig) -> dict[str, int]:
+    """Map count-admitted bindings to their strict positive thresholds."""
+
+    return {
+        binding: threshold
+        for binding, threshold in (
+            (SOURCE_WINDOW_TRIGGER_NAME, runtime.memory_source_count_threshold),
+            (TOPIC_MEMORY_SOURCE_WINDOW_BINDING, runtime.topic_memory_source_count_threshold),
+        )
+        if threshold is not None
+    }
 
 
 @asynccontextmanager
@@ -874,6 +927,7 @@ async def open_builtin_contexts(
     prompt_registry: PromptRegistry | None = None,
     prompt_demonstrators: dict[str, DemonstrationGenerator] | None = None,
     handoff_verification_keys: tuple[bytes, ...] = (),
+    on_count_request: Callable[[str], None] | None = None,
     _topic_memory_worker: bool = False,
 ) -> AsyncIterator[RelationalContexts]:
     """Open the selected database and expose scope-bound PowerContext providers."""
@@ -950,6 +1004,8 @@ async def open_builtin_contexts(
                 source_registry=source_registry,
                 cursor_secret=cursor_secret,
                 tracing=tracing,
+                source_count_admissions=_source_count_admissions(config.runtime),
+                on_count_request=on_count_request,
             )
             try:
                 await contexts.scopes.bootstrap_default()
@@ -1027,6 +1083,8 @@ async def open_builtin_contexts(
             source_registry=source_registry,
             cursor_secret=cursor_secret,
             tracing=tracing,
+            source_count_admissions=_source_count_admissions(config.runtime),
+            on_count_request=on_count_request,
         )
         try:
             await contexts.scopes.bootstrap_default()
