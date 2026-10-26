@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -96,7 +97,7 @@ class PreparedContextOmissions:
 class PreparedContextBuild:
     """Final public context and the exact origins selected to produce it.
 
-    ``omissions`` is always filled by the Builder. The RFC 1560 recall trace is deliberately
+    ``omissions`` is always filled by the Builder. The RFC 1565 recall trace is deliberately
     **not** a field here: ``ScopedContextApplication._prepare`` returns ``build.context`` and
     discards the rest, so such a field would have no production observer. The trace is
     delivered through the Runtime's optional ``RecallEffortSink`` instead.
@@ -106,6 +107,17 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedEvidenceFragment, ...] = ()
+
+
+@dataclass(frozen=True)
+class PreparedEvidenceFragment:
+    """One literal original-text span selected from a Memory candidate."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 @dataclass(frozen=True)
@@ -235,6 +247,13 @@ class PreparedContextBuilder:
         if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
             raise PreparedContextInvariantError("experience-candidate-limit")
 
+        if request.evidence_selection and request.assembly is None and not code_candidates:
+            return self._build_evidence_fragments(
+                request=request,
+                current_scope_id=current_scope_id,
+                memory_candidates=memory_candidates,
+            )
+
         content, origins, omissions = self._select_entries(
             request=request,
             current_scope_id=current_scope_id,
@@ -292,6 +311,49 @@ class PreparedContextBuilder:
             truncated_items=omissions.truncated_items,
             dropped_items=omissions.dropped_items,
             unused_bytes=max(0, request.max_bytes - content_bytes),
+        )
+
+    def _build_evidence_fragments(
+        self,
+        *,
+        request: PrepareContextRequest,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        """Select query-relevant literal spans from Memory candidates within the budget."""
+
+        scored = _rank_evidence_spans(request.query, memory_candidates)
+        selected: list[_ScoredSpan] = []
+        rendered_items: list[dict[str, object]] = []
+        for span in scored:
+            candidate_items = [*rendered_items, _fragment_item(span)]
+            content = _render_fragment_envelope(candidate_items)
+            if len(content.encode("utf-8")) > request.max_bytes:
+                if not rendered_items:
+                    continue
+                break
+            rendered_items = candidate_items
+            selected.append(span)
+            if len(selected) >= self.entry_limit * 4:
+                break
+        if not selected:
+            return PreparedContextBuild(context=self.empty(), origins=(), omissions=PreparedContextOmissions())
+        content = _render_fragment_envelope(rendered_items)
+        content_bytes = len(content.encode("utf-8"))
+        if content_bytes > request.max_bytes:
+            raise PreparedContextInvariantError("output-budget")
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
+            origins=tuple(span.citation for span in selected),
+            fragments=tuple(
+                PreparedEvidenceFragment(
+                    address=span.address,
+                    start=span.start,
+                    end=span.end,
+                    text=span.text,
+                )
+                for span in selected
+            ),
         )
 
     def _select_entries(
@@ -676,6 +738,109 @@ def _interleave(
         if index < len(experiences):
             ordered.append(experiences[index])
     return tuple(ordered)
+
+
+@dataclass(frozen=True)
+class _ScoredSpan:
+    """One literal candidate span with its origin, position and query relevance."""
+
+    citation: MemoryCitation
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
+    relevance: int
+    order: tuple[int, int, int]
+
+
+_SENTENCE_SPAN = re.compile(r"[^.!?\n]+(?:[.!?]+|\n|$)")
+_LATIN_TERM = re.compile(r"[a-z0-9]+")
+_CJK_TERM = re.compile(r"[\u4e00-\u9fff]+")
+
+
+def _rank_evidence_spans(query: str, memory_candidates: Sequence[PreparedMemoryCandidates]) -> tuple[_ScoredSpan, ...]:
+    latin_terms = tuple(_LATIN_TERM.findall(query.lower()))
+    cjk_terms = tuple(_CJK_TERM.findall(query))
+    spans: list[_ScoredSpan] = []
+    seen_identities: set[tuple[str, str]] = set()
+    order = 0
+    for group_index, group in enumerate(memory_candidates):
+        scope_id = group.scope_id or ""
+        for hit_index, hit in enumerate(group.hits):
+            identity = (hit.entry_id, hit.entry_version_id)
+            if identity in seen_identities or not hit.text.strip():
+                continue
+            seen_identities.add(identity)
+            for start, end, sentence in _sentence_spans(hit.text):
+                lowered = sentence.lower()
+                words = set(_LATIN_TERM.findall(lowered))
+                relevance = sum(1 for term in latin_terms if term in words) + sum(
+                    1 for term in cjk_terms if term and term in lowered
+                )
+                citation = MemoryCitation(
+                    memory_ref=hit.memory_ref,
+                    entry_id=hit.entry_id,
+                    entry_version_id=hit.entry_version_id,
+                )
+                address = MemoryEntryAddress(
+                    memory=ArtifactAddress(scope_id=scope_id, artifact=hit.memory_ref),
+                    entry_id=hit.entry_id,
+                    entry_version_id=hit.entry_version_id,
+                )
+                spans.append(
+                    _ScoredSpan(
+                        citation=citation,
+                        address=address,
+                        start=start,
+                        end=end,
+                        text=sentence,
+                        relevance=relevance,
+                        order=(group_index, hit_index, order),
+                    )
+                )
+                order += 1
+    relevant = tuple(span for span in spans if span.relevance > 0)
+    if relevant:
+        return tuple(sorted(relevant, key=lambda span: (-span.relevance, span.order)))
+    leading = tuple(span for span in spans if span.order[2] < 2 * len(memory_candidates) * 2)
+    return tuple(sorted(leading, key=lambda span: span.order))
+
+
+def _sentence_spans(text: str) -> tuple[tuple[int, int, str], ...]:
+    spans: list[tuple[int, int, str]] = []
+    for match in _SENTENCE_SPAN.finditer(text):
+        start, end = match.span()
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        while start < end and text[start].isspace():
+            start += 1
+        if start >= end:
+            continue
+        spans.append((start, end, text[start:end]))
+    return tuple(spans)
+
+
+def _fragment_item(span: _ScoredSpan) -> dict[str, object]:
+    return {
+        "citation": {
+            "scope_id": span.address.memory.scope_id,
+            "memory_ref": span.address.memory.artifact.model_dump(mode="json"),
+            "entry_id": span.address.entry_id,
+            "entry_version_id": span.address.entry_version_id,
+        },
+        "content": span.text,
+        "start": span.start,
+        "end": span.end,
+    }
+
+
+def _render_fragment_envelope(items: Sequence[dict[str, object]]) -> str:
+    envelope = {
+        "trust": "untrusted_history",
+        "items": list(items),
+    }
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
 
 
 def _interleave_groups(groups: Sequence[Sequence[_Item]]) -> tuple[_Item, ...]:
