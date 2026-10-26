@@ -79,15 +79,22 @@ class ContextPack:
 
     @property
     def digest(self) -> str:
-        return _digest_items(self.items)
+        cached = self.__dict__.get("_digest")
+        if cached is None:
+            cached = _digest_items(self.items)
+            object.__setattr__(self, "_digest", cached)
+        return cached
 
     @property
     def byte_count(self) -> int:
         return len(self.to_bytes())
 
     def to_bytes(self) -> bytes:
-        payload, _ = _encode_pack(self.items)
-        return payload
+        cached = self.__dict__.get("_encoded")
+        if cached is None:
+            cached = _encode_pack(self.items, digest=self.digest)
+            object.__setattr__(self, "_encoded", cached)
+        return cached
 
     @classmethod
     def from_bytes(cls, raw: bytes) -> ContextPack:
@@ -135,7 +142,11 @@ class ContextPackDelta:
         return len(self.to_bytes())
 
     def to_bytes(self) -> bytes:
-        return _encode_delta(self.base_digest, self.target_digest, self.prefix_items, self.appended)
+        cached = self.__dict__.get("_encoded")
+        if cached is None:
+            cached = _encode_delta(self.base_digest, self.target_digest, self.prefix_items, self.appended)
+            object.__setattr__(self, "_encoded", cached)
+        return cached
 
     @classmethod
     def from_bytes(cls, raw: bytes) -> ContextPackDelta:
@@ -173,19 +184,24 @@ def apply_context_pack_delta(base: ContextPack, delta: ContextPackDelta) -> Cont
 
 
 def _digest_items(items: tuple[bytes, ...]) -> str:
-    unsigned = {"schema": PACK_SCHEMA, "items": [base64.b64encode(item).decode("ascii") for item in items]}
+    unsigned = _unsigned_pack(items)
     canonical = json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
     return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
 
 
-def _encode_pack(items: tuple[bytes, ...]) -> tuple[bytes, int]:
-    unsigned = {"schema": PACK_SCHEMA, "items": [base64.b64encode(item).decode("ascii") for item in items]}
+def _unsigned_pack(items: tuple[bytes, ...]) -> dict[str, Any]:
+    return {"schema": PACK_SCHEMA, "items": [base64.b64encode(item).decode("ascii") for item in items]}
+
+
+def _encode_pack(items: tuple[bytes, ...], *, digest: str | None = None) -> bytes:
+    unsigned = _unsigned_pack(items)
+    payload_digest = _digest_items(items) if digest is None else digest
     byte_count = 0
     while True:
-        payload = {**unsigned, "digest": _digest_items(items), "byte_count": byte_count}
+        payload = {**unsigned, "digest": payload_digest, "byte_count": byte_count}
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         if len(encoded) == byte_count:
-            return encoded, byte_count
+            return encoded
         byte_count = len(encoded)
 
 

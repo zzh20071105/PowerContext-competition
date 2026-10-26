@@ -81,7 +81,7 @@ class SourceLifecycleApplication:
 
 
 class _Node:
-    __slots__ = ("node_id", "kind", "ref", "parents", "policy", "revision", "available", "last_sequence", "last_event")
+    __slots__ = ("available", "kind", "last_event", "last_sequence", "node_id", "parents", "policy", "ref", "revision")
 
     def __init__(
         self,
@@ -183,24 +183,24 @@ class ScopedSourceLifecycleService:
         async with database.transaction() as connection:
             node = await _load_row(connection, self.scope_id, event.node_id)
             if node is None:
-                raise SourceLifecycleError(f"unknown lifecycle node {event.node_id!r}")
+                raise SourceLifecycleError(f"unknown lifecycle node {event.node_id!r}")  # noqa: TRY003
             if node.kind != KIND_SOURCE:
-                raise SourceLifecycleError(f"lifecycle events only apply to Source nodes, not {event.node_id!r}")
+                message = f"lifecycle events only apply to Source nodes, not {event.node_id!r}"
+                raise SourceLifecycleError(message)
             if event.revision != node.revision:
-                raise SourceLifecycleError(
-                    f"event revision {event.revision} does not match lifecycle revision {node.revision}"
-                )
+                message = f"event revision {event.revision} does not match lifecycle revision {node.revision}"
+                raise SourceLifecycleError(message)
             if event.sequence == node.last_sequence:
                 if node.last_event is not None and _same_event(node.last_event, event):
                     replay = True
                 else:
-                    raise SourceLifecycleError(f"sequence {event.sequence} was already used by a different event")
+                    message = f"sequence {event.sequence} was already used by a different event"
+                    raise SourceLifecycleError(message)
             elif event.sequence > node.last_sequence:
                 replay = False
             else:
-                raise SourceLifecycleError(
-                    f"sequence {event.sequence} is not above the applied sequence {node.last_sequence}"
-                )
+                message = f"sequence {event.sequence} is not above the applied sequence {node.last_sequence}"
+                raise SourceLifecycleError(message)
             if not replay:
                 await connection.execute(
                     update(table)
@@ -219,13 +219,13 @@ class ScopedSourceLifecycleService:
         """Return the bound reference for generation or audit use."""
 
         if purpose not in _PURPOSES:
-            raise SourceLifecycleError(f"unknown lifecycle purpose {purpose!r}")
+            raise SourceLifecycleError(f"unknown lifecycle purpose {purpose!r}")  # noqa: TRY003
         nodes = await self._load_nodes()
         node = next((item for item in nodes if item.node_id == node_id), None)
         if node is None:
-            raise SourceLifecycleError(f"unknown lifecycle node {node_id!r}")
+            raise SourceLifecycleError(f"unknown lifecycle node {node_id!r}")  # noqa: TRY003
         if purpose == "generation" and not node.available:
-            raise SourceLifecycleError(f"lifecycle node {node_id!r} is withdrawn from generation use")
+            raise SourceLifecycleError(f"lifecycle node {node_id!r} is withdrawn from generation use")  # noqa: TRY003
         if node.kind == KIND_SOURCE:
             return SourceRef.model_validate(node.ref)
         if node.kind == KIND_MEMORY:
@@ -255,12 +255,12 @@ class ScopedSourceLifecycleService:
                     and existing.revision == revision
                 )
                 if not same:
-                    raise SourceLifecycleError(f"lifecycle node {node_id!r} is already bound to a different contract")
+                    raise SourceLifecycleError(f"lifecycle node {node_id!r} is already bound to a different contract")  # noqa: TRY003
                 return
             for parent in parents:
                 parent_row = await _load_row(connection, self.scope_id, parent)
                 if parent_row is None:
-                    raise SourceLifecycleError(f"parent lifecycle node {parent!r} is not registered")
+                    raise SourceLifecycleError(f"parent lifecycle node {parent!r} is not registered")  # noqa: TRY003
             created_index = int(
                 await connection.scalar(
                     select(func.max(table.c.created_index)).where(table.c.scope_id == self.scope_id)
@@ -322,9 +322,8 @@ class ScopedSourceLifecycleService:
                 citation = MemoryCitation.model_validate(node.ref)
                 entry = versions.get(citation.entry_id)
                 if entry is None or entry.entry_version_id != citation.entry_version_id:
-                    raise SourceLifecycleError(
-                        f"bound Memory entry {node.node_id!r} no longer matches its registered version"
-                    )
+                    message = f"bound Memory entry {node.node_id!r} no longer matches its registered version"
+                    raise SourceLifecycleError(message)
                 state = manifest_states.get(citation.entry_id)
                 if state == "active" and not targets[node.node_id]:
                     to_deactivate.append(entry)
@@ -353,20 +352,22 @@ class ScopedSourceLifecycleService:
             try:
                 current = await service.head(context.artifacts.memory_artifact_id)
             except ArtifactNotFoundError as error:
-                raise SourceLifecycleError("cited Memory artifact does not exist") from error
+                message = "cited Memory artifact does not exist"
+                raise SourceLifecycleError(message) from error
             if citation.memory_ref.artifact_id != current.artifact_id:
-                raise SourceLifecycleError("cited Memory artifact does not match the current scope artifact")
+                raise SourceLifecycleError("cited Memory artifact does not match the current scope artifact")  # noqa: TRY003
             for item in current.content.manifest.entries:
                 if item.entry_id == citation.entry_id and item.entry_version_id == citation.entry_version_id:
                     return
-            raise SourceLifecycleError("cited Memory entry version is not readable")
+            raise SourceLifecycleError("cited Memory entry version is not readable")  # noqa: TRY003
 
     async def _require_readable_topic(self, reference: ArtifactRef) -> None:
         records = self._runtime.records.for_scope(self.scope_id)
         try:
             await records.get_artifact_revision("topic-memory", reference.artifact_id, reference.revision)
         except Exception as error:
-            raise SourceLifecycleError("referenced Topic Memory revision is not readable") from error
+            message = "referenced Topic Memory revision is not readable"
+            raise SourceLifecycleError(message) from error
 
 
 async def withdrawn_topic_artifact_ids(database: Any, scope_id: str, /) -> frozenset[str]:

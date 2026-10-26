@@ -181,16 +181,29 @@ class SourceRepository:
         intents = ArtifactProcessingIntentRepository()
         for binding_name in SOURCE_PROCESSING_BINDINGS:
             await intents.mark_dirty(connection, scope_id, binding_name)
-        if self._count_admissions:
-            cursors = SourceCursorRepository()
-            for binding_name, threshold in self._count_admissions.items():
-                cursor = await cursors.load(connection, scope_id, binding_name)
-                cursor_sequence = 0 if cursor is None else cursor.cursor.sequence
-                if position - cursor_sequence >= threshold:
-                    await intents.request(connection, scope_id, binding_name)
-                    if self._on_count_request is not None:
-                        self._on_count_request(binding_name)
+        await self._request_count_admissions(connection, scope_id, position, intents)
         return StoredSource(ref=ref, value=source, journal_position=position), True
+
+    async def _request_count_admissions(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        position: int,
+        intents: ArtifactProcessingIntentRepository,
+        /,
+    ) -> None:
+        """Request count admission for families whose pending entries reach the gate."""
+
+        if not self._count_admissions:
+            return
+        cursors = SourceCursorRepository()
+        for binding_name, threshold in self._count_admissions.items():
+            cursor = await cursors.load(connection, scope_id, binding_name)
+            cursor_sequence = 0 if cursor is None else cursor.cursor.sequence
+            if position - cursor_sequence >= threshold:
+                await intents.request(connection, scope_id, binding_name)
+                if self._on_count_request is not None:
+                    self._on_count_request(binding_name)
 
     async def get(
         self,

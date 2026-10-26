@@ -142,7 +142,7 @@ class CoalescingEmbeddingModel:
             result = await self._model.embed(batch)
             if len(result.vectors) != len(batch):
                 message = "embedding provider returned a mismatching vector count"
-                raise ValueError(message)
+                raise ValueError(message)  # noqa: TRY301 - delivered to waiters by the handler below
             usage = result.usage
             for text, vector in zip(batch, result.vectors, strict=True):
                 if self._cache_size:
@@ -153,7 +153,7 @@ class CoalescingEmbeddingModel:
                 future = self._waiters.pop(text, None)
                 if future is not None and not future.done():
                     future.set_result((vector, usage, sequence))
-        except BaseException as error:  # noqa: BLE001 - waiters must observe every failure
+        except BaseException as error:
             for text in batch:
                 future = self._waiters.pop(text, None)
                 if future is not None and not future.done():

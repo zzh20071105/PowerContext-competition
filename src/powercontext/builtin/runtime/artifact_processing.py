@@ -144,10 +144,14 @@ class ArtifactProcessingBinding:
                 raise ValueError("automatic interval must be positive")  # noqa: TRY003
             if self.cron is not None:
                 raise ValueError("interval and cron cannot both be enabled")  # noqa: TRY003
-        if self.count_threshold is not None and (type(self.count_threshold) is not int or self.count_threshold < 1):
-            raise ValueError("count_threshold must be a positive integer")  # noqa: TRY003
+        _require_positive_count_threshold(self.count_threshold)
         if self.cron is not None:
             CronTrigger.from_crontab(self.cron, timezone=ZoneInfo(self.timezone))
+
+
+def _require_positive_count_threshold(threshold: int | None) -> None:
+    if threshold is not None and (type(threshold) is not int or threshold < 1):
+        raise ValueError("count_threshold must be a positive integer")  # noqa: TRY003
 
 
 class _WorkerResultSender(Protocol):
@@ -1004,9 +1008,7 @@ class ArtifactProcessingSupervisor:
                     )
                 state.retries.pop(scope, None)
                 state.completed += 1
-                if await self._maybe_request_count_admission(state, scope):
-                    self.wake(state.binding.binding_name)
-                elif row.requested_generation > row.handled_generation:
+                if await self._maybe_request_count_admission(state, scope) or row.requested_generation > row.handled_generation:
                     self.wake(state.binding.binding_name)
             except (ArtifactProcessingLeadershipLostError, _WorkerTerminationError):
                 # Retain the slot until the old term is revoked and all children are reaped.

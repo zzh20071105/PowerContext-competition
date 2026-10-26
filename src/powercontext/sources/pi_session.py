@@ -27,7 +27,6 @@ from pydantic import BaseModel, Field, JsonValue
 from powercontext.limits import MAX_SOURCE_ID_LENGTH
 from powercontext.sources import TEXT_EVIDENCE_PROJECTION_KEY, AdapterSourceDefinition, TextEvidence
 from powercontext.sources.connectors import (
-    Connector,
     ConnectorRunCompletion,
     ConnectorRunSession,
     ConnectorRunStatus,
@@ -135,32 +134,44 @@ def _decode_session(content: bytes) -> tuple[dict[str, Any], dict[str, dict[str,
             raise ValueError(message) from error
         if not isinstance(row, dict):
             message = "Pi session lines must be JSON objects"
-            raise ValueError(message)
+            raise ValueError(message)  # noqa: TRY004 - the archive contract fails as ValueError
         if header is None:
-            if row.get("type") != "session" or row.get("version") != 3 or not _is_non_empty_str(row.get("id")):
-                message = "first record must be a type=session version=3 header with a non-empty id"
-                raise ValueError(message)
+            _require_session_header(row)
             header = row
             continue
-        record_id = row.get("id")
-        if not _is_non_empty_str(record_id):
-            message = "session records must carry a non-empty string id"
-            raise ValueError(message)
-        if record_id in records or record_id == header["id"]:
-            message = "session record ids must be unique"
-            raise ValueError(message)
-        parent_id = row.get("parentId")
-        if parent_id is not None and not isinstance(parent_id, str):
-            message = "parentId must be null or a string"
-            raise ValueError(message)
-        if isinstance(parent_id, str) and parent_id and parent_id not in records and parent_id != header["id"]:
-            message = "parentId must reference an earlier record"
-            raise ValueError(message)
-        records[record_id] = row
+        _register_session_record(row, header, records)
     if header is None:
         message = "Pi session archive must start with a session header"
         raise ValueError(message)
     return header, records
+
+
+def _require_session_header(row: dict[str, Any]) -> None:
+    if row.get("type") != "session" or row.get("version") != 3 or not _is_non_empty_str(row.get("id")):
+        message = "first record must be a type=session version=3 header with a non-empty id"
+        raise ValueError(message)
+
+
+def _register_session_record(
+    row: dict[str, Any],
+    header: dict[str, Any],
+    records: dict[str, dict[str, Any]],
+) -> None:
+    record_id = row.get("id")
+    if not _is_non_empty_str(record_id):
+        message = "session records must carry a non-empty string id"
+        raise ValueError(message)
+    if record_id in records or record_id == header["id"]:
+        message = "session record ids must be unique"
+        raise ValueError(message)
+    parent_id = row.get("parentId")
+    if parent_id is not None and not isinstance(parent_id, str):
+        message = "parentId must be null or a string"
+        raise ValueError(message)
+    if isinstance(parent_id, str) and parent_id and parent_id not in records and parent_id != header["id"]:
+        message = "parentId must reference an earlier record"
+        raise ValueError(message)
+    records[record_id] = row
 
 
 def _visible_event(session_id: str, record: dict[str, Any]) -> PiEventInput | None:

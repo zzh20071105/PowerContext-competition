@@ -22,9 +22,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 from pydantic import BaseModel
-
 from pypdf import PdfReader
-from pypdf.errors import PdfReadError
 
 from powercontext.limits import MAX_SOURCE_ID_LENGTH
 from powercontext.sources import TEXT_EVIDENCE_PROJECTION_KEY, AdapterSourceDefinition, TextEvidence
@@ -86,15 +84,14 @@ def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
         raise ValueError(message)
     try:
         reader = PdfReader(io.BytesIO(value.content))
-        if reader.is_encrypted:
-            if not reader.decrypt(""):
-                message = "encrypted PDF requires a user password"
-                raise ValueError(message)
+        if reader.is_encrypted and not reader.decrypt(""):
+            message = "encrypted PDF requires a user password"
+            raise ValueError(message)  # noqa: TRY301 - re-raised unchanged by the handler below
         pages = tuple(reader.pages)
         texts = tuple(page.extract_text() or "" for page in pages)
     except ValueError:
         raise
-    except Exception as error:  # noqa: BLE001 - every pypdf failure is one atomic ValueError
+    except Exception as error:
         message = "PDF content could not be parsed completely"
         raise ValueError(message) from error
     document_sha256 = hashlib.sha256(value.content).hexdigest()
@@ -179,8 +176,8 @@ async def search_pdf_pages(
         raise ValueError(message)
     citations: list[MemoryCitation] = []
     seen_sources: set[str] = set()
-    search_limit = max(limit * 2, limit)
-    page = await memory.search(SearchMemoryRequest(query=question, mode="fts", limit=search_limit))
+    # Fetch twice the budget so source-level deduplication can still fill it.
+    page = await memory.search(SearchMemoryRequest(query=question, mode="fts", limit=limit * 2))
     for hit in page.hits:
         citation = MemoryCitation(
             memory_ref=hit.memory_ref,

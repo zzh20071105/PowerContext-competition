@@ -329,9 +329,9 @@ class PreparedContextBuilder:
             candidate_items = [*rendered_items, _fragment_item(span)]
             content = _render_fragment_envelope(candidate_items)
             if len(content.encode("utf-8")) > request.max_bytes:
-                if not rendered_items:
-                    continue
-                break
+                # Keep trying later (possibly shorter) spans so the byte budget
+                # still fills with relevant evidence instead of stopping early.
+                continue
             rendered_items = candidate_items
             selected.append(span)
             if len(selected) >= self.entry_limit * 4:
