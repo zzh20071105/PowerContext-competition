@@ -167,6 +167,7 @@ from powercontext.builtin.runtime._scope_cache import (
     ScopeEvictor,
 )
 from powercontext.builtin.runtime.context_pack import ContextPack, ContextPackDelta
+from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleApplication, withdrawn_topic_artifact_ids
 from powercontext.builtin.runtime.decision_model import DecisionModel
 from powercontext.builtin.runtime.errors import InvalidRuntimeRequestError, TopicMemoryProcessingUnavailableError
 from powercontext.builtin.runtime.models import (
@@ -3072,7 +3073,7 @@ class BuiltinRuntime:
         self._skill_package_uploader = skill_package_uploader
         self._skill_usage_recorder = skill_usage_recorder
         self._experience_incubator = experience_incubator
-        self._topic_memory_search = topic_memory_search
+        self._topic_memory_search = self._bind_topic_memory_search(topic_memory_search)
         self._topic_memory_get = topic_memory_get
         self._topic_memory_browse = topic_memory_browse
         self._topic_memory_flush = topic_memory_flush
@@ -3127,6 +3128,7 @@ class BuiltinRuntime:
         self.memory = MemoryApplication(self)
         self.topic_memory = TopicMemoryApplication(self)
         self.records = RecordApplication(self)
+        self.lifecycle = SourceLifecycleApplication(self)
         self.prompts = PromptApplication(self)
         self.review = ReviewApplication(self)
         self.skill = SkillApplication(self)
@@ -3138,6 +3140,27 @@ class BuiltinRuntime:
         self.experience_processor = (
             None if scope_ids is None or experience_incubator is None else ScheduledExperienceProcessor(self, scope_ids)
         )
+
+    def _bind_topic_memory_search(self, search: Any) -> Any:
+        """Withdrawn Topic revisions stay out of native search and prepared Context."""
+
+        if search is None:
+            return None
+
+        async def lifecycle_aware_topic_search(scope_id: str, query: str, /, **kwargs: Any):
+            result = await search(scope_id, query, **kwargs)
+            withdrawn = await withdrawn_topic_artifact_ids(self._provider.database, scope_id)
+            if not withdrawn or not result.hits:
+                return result
+            return result.model_copy(
+                update={
+                    "hits": tuple(
+                        hit for hit in result.hits if hit.artifact_ref.artifact_id not in withdrawn
+                    )
+                }
+            )
+
+        return lifecycle_aware_topic_search
 
     async def __aenter__(self) -> BuiltinRuntime:
         return self

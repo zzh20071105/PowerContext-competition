@@ -895,7 +895,28 @@ RECALL_TOKEN_DAILY_TABLE = Table(
     CheckConstraint("recalled_tokens >= 0", name="ck_pc_recall_token_daily_recalled_nonnegative"),
 )
 
+SOURCE_LIFECYCLE_TABLE = Table(
+    "pc_source_lifecycle",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(MAX_SOURCE_ID_LENGTH), primary_key=True),
+    Column("kind", identity_string(MAX_SOURCE_TYPE_LENGTH), nullable=False),
+    Column("ref_payload", _canonical_payload_type(), nullable=False),
+    Column("parents_payload", _canonical_payload_type(), nullable=False),
+    Column("policy", identity_string(8), nullable=False),
+    Column("revision", Integer, nullable=False),
+    Column("available", Boolean, nullable=False),
+    Column("last_sequence", Integer, nullable=False),
+    Column("last_event_payload", _canonical_payload_type(), nullable=True),
+    Column("created_index", BigInteger, nullable=False),
+    CheckConstraint("revision > 0", name="ck_pc_source_lifecycle_revision_positive"),
+    CheckConstraint("last_sequence >= 0", name="ck_pc_source_lifecycle_sequence_nonnegative"),
+    CheckConstraint("created_index >= 0", name="ck_pc_source_lifecycle_created_index_nonnegative"),
+    UniqueConstraint("scope_id", "created_index", name="uq_pc_source_lifecycle_scope_created_index"),
+)
+
 SHARED_TABLES = (
+    SOURCE_LIFECYCLE_TABLE,
     SOURCE_JOURNAL_HEADS_TABLE,
     SOURCES_TABLE,
     ARTIFACTS_TABLE,
