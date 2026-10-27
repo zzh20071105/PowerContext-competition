@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Original visible-event capture for one selected Pi session branch."""
+"""Original visible-event capture for one selected Pi session branch.
+
+The archive layer validates the whole JSONL file before returning anything. The
+render layer turns each record on the selected ancestor chain into its literal
+visible body following the challenge's fixed table. The connector layer imports
+only events missing from its durable checkpoint and refuses rewritten history.
+"""
 
 from __future__ import annotations
 
@@ -82,43 +88,19 @@ def pi_event_source_id(session_id: str, event_id: str) -> str:
     return source_id
 
 
-def parse_pi_session(value: PiSessionInput) -> tuple[PiEventInput, ...]:
-    """Return the visible events on the selected leaf's full ancestor chain.
+# ---------------------------------------------------------------------------
+# Archive layer: decode, validate and index one complete session file.
+# ---------------------------------------------------------------------------
 
-    The archive is decoded, parsed and graph-validated completely before anything is
-    returned; encoding, JSON, duplicate-id, missing-parent, cycle and missing-leaf
-    failures raise :class:`ValueError` without partial results.
+
+def _decode_archive(content: bytes) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """Decode strict UTF-8 (BOM allowed) JSONL and validate the record graph.
+
+    Returns ``(header, records)`` where ``records`` maps each record id to its
+    parsed object in file order. Any violation of the archive contract raises
+    ``ValueError`` before anything is returned.
     """
 
-    header, records = _decode_session(value.content)
-    return _visible_chain(header, records, value.leaf_id)
-
-
-def _visible_chain(
-    header: dict[str, Any],
-    records: dict[str, dict[str, Any]],
-    leaf_id: str | None,
-) -> tuple[PiEventInput, ...]:
-    selected = leaf_id if leaf_id is not None else (next(reversed(records)) if records else None)
-    if selected is None or selected not in records:
-        message = "selected leaf is missing from the session"
-        raise ValueError(message)
-    chain: list[dict[str, Any]] = []
-    current: dict[str, Any] | None = records[selected]
-    while current is not None:
-        chain.append(current)
-        parent_id = current.get("parentId")
-        # A parent equal to the session header id is a legal root link validated
-        # earlier; the chain terminates there like an empty parent reference.
-        current = records.get(parent_id) if isinstance(parent_id, str) and parent_id else None
-    return tuple(
-        event
-        for event in (_visible_event(header["id"], record) for record in reversed(chain))
-        if event is not None
-    )
-
-
-def _decode_session(content: bytes) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     try:
         text = content.decode("utf-8-sig")
     except UnicodeDecodeError as error:
@@ -136,31 +118,27 @@ def _decode_session(content: bytes) -> tuple[dict[str, Any], dict[str, dict[str,
             raise ValueError(message) from error
         if not isinstance(row, dict):
             message = "Pi session lines must be JSON objects"
-            raise ValueError(message)  # noqa: TRY004 - the archive contract fails as ValueError
+            raise ValueError(message)  # noqa: TRY004 - archive contract failures are ValueError
         if header is None:
-            _require_session_header(row)
+            _require_header(row)
             header = row
             continue
-        _register_session_record(row, header, records)
+        _register_record(row, header, records)
     if header is None:
         message = "Pi session archive must start with a session header"
         raise ValueError(message)
     return header, records
 
 
-def _require_session_header(row: dict[str, Any]) -> None:
-    if row.get("type") != "session" or row.get("version") != 3 or not _is_non_empty_str(row.get("id")):
+def _require_header(row: dict[str, Any]) -> None:
+    if row.get("type") != "session" or row.get("version") != 3 or not _is_text(row.get("id")):
         message = "first record must be a type=session version=3 header with a non-empty id"
         raise ValueError(message)
 
 
-def _register_session_record(
-    row: dict[str, Any],
-    header: dict[str, Any],
-    records: dict[str, dict[str, Any]],
-) -> None:
+def _register_record(row: dict[str, Any], header: dict[str, Any], records: dict[str, dict[str, Any]]) -> None:
     record_id = row.get("id")
-    if not _is_non_empty_str(record_id):
+    if not _is_text(record_id):
         message = "session records must carry a non-empty string id"
         raise ValueError(message)
     if record_id in records or record_id == header["id"]:
@@ -176,7 +154,40 @@ def _register_session_record(
     records[record_id] = row
 
 
-def _visible_event(session_id: str, record: dict[str, Any]) -> PiEventInput | None:
+def _ancestor_chain(
+    header: dict[str, Any],
+    records: dict[str, dict[str, Any]],
+    leaf_id: str | None,
+) -> list[dict[str, Any]]:
+    """Return the selected leaf's ancestor chain ordered root first.
+
+    The chain terminates at a record without a parent; a parent equal to the
+    session header id is a legal root link because the header has appeared
+    before every record. Passing ``None`` selects the file's last record.
+    """
+
+    selected = leaf_id if leaf_id is not None else (next(reversed(records)) if records else None)
+    if selected is None or selected not in records:
+        message = "selected leaf is missing from the session"
+        raise ValueError(message)
+    chain: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = records[selected]
+    while current is not None:
+        chain.append(current)
+        parent_id = current.get("parentId")
+        current = records.get(parent_id) if isinstance(parent_id, str) and parent_id else None
+    chain.reverse()
+    return chain
+
+
+# ---------------------------------------------------------------------------
+# Render layer: one record to its literal visible body, per the fixed table.
+# ---------------------------------------------------------------------------
+
+
+def _render_event(session_id: str, record: dict[str, Any]) -> PiEventInput | None:
+    """Render one record, or ``None`` when the record has no visible body."""
+
     event_type = record.get("type")
     parent_id = record.get("parentId") or None
     if event_type == "message":
@@ -184,13 +195,13 @@ def _visible_event(session_id: str, record: dict[str, Any]) -> PiEventInput | No
         if not isinstance(message, dict):
             return None
         role = message.get("role")
-        if not _is_non_empty_str(role):
+        if not _is_text(role):
             return None
         body = _message_body(role, message)
     elif event_type in _SUMMARY_EVENT_TYPES:
         role = event_type
         summary = record.get("summary")
-        if not _is_non_empty_str(summary):
+        if not _is_text(summary):
             return None
         body = summary
     elif event_type == "custom_message":
@@ -221,6 +232,8 @@ def _message_body(role: str, message: dict[str, Any]) -> str:
 
 
 def _content_body(content: object) -> str:
+    """Render message content: strings as-is, blocks one line each, joined by ``\\n``."""
+
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
@@ -235,18 +248,15 @@ def _content_body(content: object) -> str:
             if isinstance(text, str):
                 parts.append(text)
         elif block_type == "toolCall":
-            arguments = block.get("arguments")
-            encoded = json.dumps(
-                arguments if arguments is not None else {},
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
+            parts.append(
+                f"[tool_call {block.get('name', '')} {block.get('id', '')}] {_compact_json(block.get('arguments'))}"
             )
-            parts.append(f"[tool_call {block.get('name', '')} {block.get('id', '')}] {encoded}")
     return "\n".join(parts)
 
 
 def _text_body(content: object) -> str:
+    """Join the visible string or text blocks of a content value with ``\\n``."""
+
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
@@ -258,8 +268,36 @@ def _text_body(content: object) -> str:
     )
 
 
-def _is_non_empty_str(value: object) -> bool:
+def _compact_json(arguments: object) -> str:
+    """Compact separators, sorted keys, Unicode preserved."""
+
+    return json.dumps(arguments if arguments is not None else {}, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _is_text(value: object) -> bool:
     return isinstance(value, str) and value != ""
+
+
+def parse_pi_session(value: PiSessionInput) -> tuple[PiEventInput, ...]:
+    """Return the visible events on the selected leaf's full ancestor chain.
+
+    The archive is decoded, validated and the chain resolved completely before
+    any event is returned; encoding, JSON, duplicate-id, missing-parent, cycle
+    and missing-leaf failures raise ``ValueError`` without partial results.
+    """
+
+    header, records = _decode_archive(value.content)
+    chain = _ancestor_chain(header, records, value.leaf_id)
+    return tuple(
+        event
+        for event in (_render_event(header["id"], record) for record in chain)
+        if event is not None
+    )
+
+
+# ---------------------------------------------------------------------------
+# Source definition: identity, projection and read round-trip.
+# ---------------------------------------------------------------------------
 
 
 class PiEventAdapter:
@@ -325,8 +363,26 @@ PI_EVENT_SOURCE_DEFINITION = AdapterSourceDefinition(
 )
 
 
+# ---------------------------------------------------------------------------
+# Connector layer: incremental import guarded by the durable checkpoint.
+# ---------------------------------------------------------------------------
+
+
+def _record_digest(record: dict[str, Any]) -> str:
+    canonical = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 class PiSessionConnector:
-    """Incrementally import the selected branch of one on-disk Pi session file."""
+    """Incrementally import the selected branch of one on-disk Pi session file.
+
+    Each run re-parses the whole file, then submits only the selected branch's
+    visible events missing from the checkpoint. The checkpoint carries the
+    identity and record digest of every event imported so far, so restarts
+    deduplicate and rewritten imported history is rejected with ``ValueError``
+    before anything is submitted; a rejected run leaves the committed progress
+    untouched and the caller can retry after repairing the input.
+    """
 
     name = PI_SESSION_CONNECTOR_NAME
     version = "1"
@@ -337,65 +393,78 @@ class PiSessionConnector:
         self.leaf_id = leaf_id
 
     async def run(self, session: ConnectorRunSession, /) -> ConnectorRunCompletion:
-        header, records = _decode_session(self.path.read_bytes())
-        state = _CheckpointState.load(session.checkpoint)
-        state.validate_unchanged(header, records)
-        events = _visible_chain(header, records, self.leaf_id)
-        imported = dict(state.imported)
+        header, records = _decode_session_file(self.path)
+        previous = _Checkpoint.load(session.checkpoint)
+        previous.require_same_session(header["id"])
+        previous.require_unchanged(records)
+        events = tuple(
+            event
+            for event in (_render_event(header["id"], record) for record in _ancestor_chain(header, records, self.leaf_id))
+            if event is not None
+        )
+        checkpoint = previous.advance()
+        if not checkpoint.session_id:
+            checkpoint.session_id = header["id"]
         for event in events:
             identity = pi_event_source_id(event.session_id, event.event_id)
-            if identity in imported:
+            if event.event_id in checkpoint.records:
                 continue
             await session.submit(identity, PI_EVENT_SOURCE_NAME, event)
-            imported[identity] = _digest_record(event.record)
-        checkpoint = {
-            "session_id": header["id"],
-            "imported": imported,
-            "digests": {record_id: _digest_record(record) for record_id, record in records.items()},
-        }
-        return ConnectorRunCompletion(status=ConnectorRunStatus.COMPLETE, checkpoint=checkpoint)
+            checkpoint.records[event.event_id] = _record_digest(event.record)
+        return ConnectorRunCompletion(status=ConnectorRunStatus.COMPLETE, checkpoint=checkpoint.dump())
 
 
-class _CheckpointState:
-    """Opaque JSON checkpoint: imported identities plus digests of every file record."""
+def _decode_session_file(path: Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    try:
+        content = path.read_bytes()
+    except OSError as error:
+        message = "Pi session file could not be read"
+        raise ValueError(message) from error
+    return _decode_archive(content)
 
-    def __init__(self, session_id: str, imported: dict[str, str], digests: dict[str, str]) -> None:
+
+class _Checkpoint:
+    """Durable progress: the session id plus a digest per imported event."""
+
+    def __init__(self, session_id: str, records: dict[str, str]) -> None:
         self.session_id = session_id
-        self.imported = imported
-        self.digests = digests
+        self.records = records
 
     @classmethod
-    def load(cls, checkpoint: object) -> _CheckpointState:
+    def load(cls, checkpoint: object) -> _Checkpoint:
         if not isinstance(checkpoint, dict):
-            return cls("", {}, {})
+            return cls("", {})
         session_id = checkpoint.get("session_id")
-        imported = checkpoint.get("imported")
-        digests = checkpoint.get("digests")
+        records = checkpoint.get("records")
         return cls(
             session_id if isinstance(session_id, str) else "",
-            {key: value for key, value in (imported or {}).items() if isinstance(key, str) and isinstance(value, str)},
-            {key: value for key, value in (digests or {}).items() if isinstance(key, str) and isinstance(value, str)},
+            {
+                event_id: digest
+                for event_id, digest in (records or {}).items()
+                if isinstance(event_id, str) and isinstance(digest, str)
+            },
         )
 
-    def validate_unchanged(self, header: dict[str, Any], records: dict[str, dict[str, Any]]) -> None:
-        if not self.imported and not self.digests:
-            return
-        if self.session_id and header.get("id") != self.session_id:
+    def require_same_session(self, session_id: str) -> None:
+        if self.session_id and session_id and self.session_id != session_id:
             message = "session id changed since the last checkpoint"
             raise ValueError(message)
-        for record_id, digest in self.digests.items():
-            current = records.get(record_id)
+
+    def require_unchanged(self, records: dict[str, dict[str, Any]]) -> None:
+        for event_id, digest in self.records.items():
+            current = records.get(event_id)
             if current is None:
-                message = f"previously imported record {record_id!r} is missing from the session file"
+                message = f"imported event {event_id!r} is missing from the session file"
                 raise ValueError(message)
-            if _digest_record(current) != digest:
-                message = f"previously imported record {record_id!r} was rewritten"
+            if _record_digest(current) != digest:
+                message = f"imported event {event_id!r} was rewritten"
                 raise ValueError(message)
 
+    def advance(self) -> _Checkpoint:
+        return _Checkpoint(self.session_id, dict(self.records))
 
-def _digest_record(record: dict[str, Any]) -> str:
-    canonical = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    def dump(self) -> dict[str, object]:
+        return {"session_id": self.session_id, "records": dict(self.records)}
 
 
 __all__ = [
