@@ -225,7 +225,10 @@ def _render_event(session_id: str, record: dict[str, Any]) -> PiEventInput | Non
 def _message_body(role: str, message: dict[str, Any]) -> str:
     if role == "toolResult":
         text = _text_body(message.get("content"))
-        return f"[tool_result {message.get('toolName', '')} {message.get('toolCallId', '')}] {text}".rstrip()
+        prefix = f"[tool_result {message.get('toolName', '')} {message.get('toolCallId', '')}]"
+        # Original text is preserved byte for byte; the prefix loses its trailing
+        # space only when there is no text at all.
+        return f"{prefix} {text}" if text else prefix
     if role == "bashExecution":
         return f"$ {message.get('command', '')}\n{message.get('output', '')}"
     return _content_body(message.get("content"))
