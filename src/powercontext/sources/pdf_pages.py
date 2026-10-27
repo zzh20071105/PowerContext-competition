@@ -18,9 +18,9 @@ from __future__ import annotations
 
 import hashlib
 import io
+import math
 import re
 from collections import Counter
-from functools import partial
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
@@ -41,10 +41,27 @@ _MAX_SOURCE_ID_CHARS = MAX_SOURCE_ID_LENGTH
 
 _WORD = re.compile(r"[a-z0-9]+")
 
+# Question words that describe asking, not the asked-about content. Retrieval
+# ranks pages by the remaining content terms only.
+_STOP_WORDS = frozenset((
+    "a", "all", "also", "an", "and", "any", "are", "as", "at", "be", "been", "being", "both",
+    "but", "by", "can", "could", "did", "do", "does", "for", "from", "had", "has", "have",
+    "how", "if", "in", "into", "is", "it", "its", "many", "may", "much", "no", "not", "of",
+    "on", "or", "please", "should", "so", "such", "than", "that", "the", "their", "then",
+    "there", "these", "they", "this", "those", "to", "too", "was", "we", "were", "what",
+    "when", "where", "which", "who", "why", "will", "with", "would", "company", "fiscal",
+    "year", "fy", "10k", "10q", "between", "during", "about", "per", "each", "more", "most",
+    "other", "some", "own", "same", "only", "just", "based", "respectively", "within",
+    "under", "over", "upon", "among", "across", "after", "before", "because", "due",
+    "using", "used", "use", "useful", "metric", "report", "reported", "reports", "give",
+    "given", "according", "following", "follow", "like", "state",
+))
+
 # Canonical report-section signatures. FinanceBench-style questions name analyst
 # concepts (quick ratio, capex, legal battles) whose words never appear on the
-# annotated statement pages, so retrieval expands each question with the section
-# phrases that identify those pages inside SEC filings.
+# annotated statement pages, so one ranking signal expands each question with the
+# section phrases that identify those pages inside SEC filings. Filings that name
+# their sections differently are covered by the statistical signal fused below.
 _SECTION_SIGNATURES: tuple[tuple[str, int, tuple[str, ...], tuple[str, ...]], ...] = (
     ("income", 2,
      ("consolidated statement of income", "net sales", "cost of sales", "operating profit", "per share"),
@@ -85,6 +102,32 @@ _SECTION_TRIGGERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("risk", ("cyclicality", "competition", "supply", "risk")),
 )
 _ALWAYS_SECTIONS = ("income", "balance", "cashflow", "business", "mda", "risk")
+
+
+def _stem(word: str) -> str:
+    """Collapse plural inflection so ``customer``/``customers`` or
+    ``revenue``/``revenues`` match; the same function runs on questions and
+    pages, so consistent collisions are harmless."""
+
+    if len(word) <= 3:
+        return word
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"
+    if word.endswith("sses"):
+        return word[:-2]
+    if word.endswith("s") and not word.endswith(("ss", "us", "is")):
+        return word[:-1]
+    return word
+
+
+def _content_terms(text: str) -> list[str]:
+    """Stemmed content terms of a question: numbers and words above noise length."""
+
+    return [
+        stem
+        for stem in (_stem(word) for word in _WORD.findall(text.lower()))
+        if (len(stem) > 2 or stem.isdigit()) and stem not in _STOP_WORDS
+    ]
 
 
 class PDFDocumentInput(BaseModel):
@@ -214,7 +257,7 @@ PDF_PAGE_SOURCE_DEFINITION = AdapterSourceDefinition(
 
 
 def _hit_info(hit: Any) -> tuple[MemoryCitation, str, Counter] | None:
-    """Derive citation, document and word counts from one hit without any get.
+    """Derive citation, document and stemmed word counts from one hit without any get.
 
     Page entries store the document name as their first line followed by the page
     text, so the document name comes from that line and word counts from the same
@@ -231,7 +274,7 @@ def _hit_info(hit: Any) -> tuple[MemoryCitation, str, Counter] | None:
             entry_version_id=hit.entry_version_id,
         ),
         document_id,
-        Counter(_WORD.findall(body.lower())),
+        Counter(_stem(word) for word in _WORD.findall(body.lower())),
     )
 
 
@@ -245,27 +288,82 @@ async def _sweep(memory: Any, query: str, fetch: int) -> list[tuple[MemoryCitati
     return resolved
 
 
+class _PageTable:
+    """Page-grain term statistics for every captured page in one scoped Memory.
+
+    ``counts``/``tokens`` stem with the same :func:`_stem` as questions, ``idf``
+    is computed over the page population of the whole scope, and ``entry_keys``
+    maps every journal entry to its page so probe hits resolve without a get.
+    """
+
+    def __init__(self, listed: Any) -> None:
+        self.counts: dict[tuple[str, int], Counter] = {}
+        self.tokens: dict[tuple[str, int], list[str]] = {}
+        self.citations: dict[tuple[str, int], MemoryCitation] = {}
+        self.entry_keys: dict[str, tuple[str, int]] = {}
+        for record in listed.entries:
+            document_id = ""
+            page = 0
+            for reference in record.entry.sources:
+                parts = reference.source_id.split(":")
+                if len(parts) >= 4 and parts[0] == "pdf":
+                    document_id = parts[1]
+                    try:
+                        page = int(parts[3])
+                    except ValueError:
+                        page = 0
+                    break
+            if not document_id or page < 1:
+                continue
+            key = (document_id, page)
+            text = record.entry.text
+            body = text.partition("\n")[2] if text.startswith(document_id + "\n") else text
+            words = [_stem(word) for word in _WORD.findall(body.lower())]
+            self.counts.setdefault(key, Counter()).update(words)
+            self.tokens.setdefault(key, []).extend(words)
+            self.citations.setdefault(key, record.citation)
+            self.entry_keys[record.citation.entry_id] = key
+
+    def document_names(self) -> set[str]:
+        return {key[0] for key in self.counts}
+
+    def idf(self) -> dict[str, float]:
+        """Inverse document frequency over the scope's page population."""
+
+        total = max(1, len(self.counts))
+        document_frequency: Counter[str] = Counter()
+        for counts in self.counts.values():
+            document_frequency.update(counts.keys())
+        return {term: math.log(1 + total / df) for term, df in document_frequency.items()}
+
+    def document_frequency(self, term: str) -> int:
+        return sum(1 for counts in self.counts.values() if term in counts)
+
+
 def _anchor_document(
     probe: list[tuple[MemoryCitation, str, Counter]],
     question: str,
     documents: set[str],
 ) -> str:
-    """Pick the known document whose company token the question names outright.
+    """Pick the known document that the question names outright.
 
-    Only real document ids from the listing are considered: split entry pieces
-    carry arbitrary page text on their first lines, so probe first lines are not
-    trustworthy document names.
+    A question names its company either as a whole token ("3M", "PepsiCo") or as
+    run-together words ("American Water Works" vs ``AMERICANWATERWORKS``); only
+    real document ids from the listing are considered.
     """
 
-    question_words = set(_WORD.findall(question.lower()))
+    words = set(_WORD.findall(question.lower()))
+    joined = "".join(_WORD.findall(question.lower()))
     probe_docs = [document_id for _citation, document_id, _counts in probe]
     candidates = list(dict.fromkeys([*probe_docs, *sorted(documents)]))
     for document_id in candidates:
         if document_id not in documents:
             continue
-        match = re.search(r"[a-z]+", document_id.lower())
+        match = re.search(r"[a-z0-9]+", document_id.lower())
         company = match.group(0) if match else ""
-        if company and company in question_words:
+        if not company:
+            continue
+        if company in words or (len(company) >= 8 and company in joined):
             return document_id
     for document_id in probe_docs:
         if document_id in documents:
@@ -274,135 +372,259 @@ def _anchor_document(
 
 
 def _section_plan(question: str) -> list[str]:
-    sections = list(_ALWAYS_SECTIONS)
     lowered = question.lower()
+    sections = list(_ALWAYS_SECTIONS)
     for name, triggers in _SECTION_TRIGGERS:
         if any(trigger in lowered for trigger in triggers) and name not in sections:
             sections.append(name)
     return sections
 
 
-def _score_section(counts: Counter, phrases: tuple[str, ...], tokens: tuple[str, ...]) -> int:
+_HEAD_TOKENS = 40
+_SECTION_HEAD_WEIGHT = 5
+_TAIL_TF_CAP = 3
+
+
+def _score_section(
+    counts: Counter,
+    head_set: set[str],
+    phrases: tuple[str, ...],
+    tokens: tuple[str, ...],
+) -> int:
     total = 0
     for phrase in phrases:
-        if all(counts.get(token, 0) for token in phrase.split()):
-            total += 3
-    total += sum(1 for token in tokens if counts.get(token, 0) >= 2)
+        phrase_tokens = [_stem(token) for token in phrase.split()]
+        if all(counts.get(token, 0) for token in phrase_tokens):
+            # A section names itself in its leading lines; the same words
+            # mentioned mid-page are only a discussion of that section.
+            total += _SECTION_HEAD_WEIGHT if all(token in head_set for token in phrase_tokens) else 3
+    total += sum(min(counts.get(_stem(token), 0), 2) for token in tokens)
     return total
 
 
-def _rank_pages(
-    pages: list[tuple[tuple[str, int], MemoryCitation, Counter]],
-    sections: list[str],
-    question: str,
-    capacity: int,
-) -> list[tuple[MemoryCitation, tuple[str, int]]]:
-    """Section-signature ranking at page grain, mirroring an analyst's map of
-    the filing: statements, MD&A, segments, risk, legal, tax, plus a
-    question-overlap tail for concepts the signatures do not cover."""
-
-    merged: list[tuple[MemoryCitation, tuple[str, int]]] = []
-    taken_keys: set[tuple[str, int]] = set()
-
-    def push(ranked: list[tuple[tuple[str, int], MemoryCitation, Counter]], count: int) -> None:
-        for key, citation, _counts in ranked:
-            if count <= 0 or len(merged) >= capacity:
-                return
-            if key in taken_keys:
-                continue
-            taken_keys.add(key)
-            merged.append((citation, key))
-            count -= 1
-
-    for _section, quota, phrases, tokens in (s for s in _SECTION_SIGNATURES if s[0] in sections):
-        scorer = partial(_score_section, phrases=phrases, tokens=tokens)
-        ranked = sorted(pages, key=lambda info: (-scorer(info), info[0][0], info[0][1]))
-        push(ranked, quota)
-    question_words = set(_WORD.findall(question.lower()))
-    ranked_question = sorted(
-        pages, key=lambda info: (-len(question_words & set(info[2])), info[0][0], info[0][1])
-    )
-    push(ranked_question, max(0, capacity - len(merged)))
-    return merged
-
-
-def _collect_page_entries(listed: Any) -> dict[tuple[str, int], tuple[MemoryCitation, Counter]]:
-    """Aggregate listed Memory entries into page-grain token counts."""
-
-    page_entries: dict[tuple[str, int], tuple[MemoryCitation, Counter]] = {}
-    for record in listed.entries:
-        document_id = ""
-        page = 0
-        for reference in record.entry.sources:
-            parts = reference.source_id.split(":")
-            if len(parts) >= 4 and parts[0] == "pdf":
-                document_id = parts[1]
-                try:
-                    page = int(parts[3])
-                except ValueError:
-                    page = 0
-                break
-        if not document_id or page < 1:
-            continue
-        key = (document_id, page)
-        existing = page_entries.setdefault(key, (record.citation, Counter()))
-        existing[1].update(_WORD.findall(record.entry.text.lower()))
-    return page_entries
-
-
-def _rank_document_pages(
-    page_entries: dict[tuple[str, int], tuple[MemoryCitation, Counter]],
+def _signature_ranked_keys(
+    table: _PageTable,
     document_id: str,
     question: str,
     limit: int,
-) -> list[MemoryCitation]:
+) -> list[tuple[str, int]]:
     """Section-signature ranking at page grain, mirroring an analyst's map of
     the filing: statements, MD&A, segments, risk, legal, tax, plus a
     question-overlap tail for concepts the signatures do not cover."""
 
-    document_pages = [key for key in page_entries if key[0] == document_id]
-    sections = _section_plan(question)
-    ordered: list[MemoryCitation] = []
-    taken_keys: set[tuple[str, int]] = set()
+    document_pages = [key for key in table.counts if key[0] == document_id]
+    if not document_pages:
+        return []
+    ordered: list[tuple[str, int]] = []
+    taken: set[tuple[str, int]] = set()
 
     def push(ranked: list[tuple[str, int]], count: int) -> None:
         for key in ranked:
             if count <= 0 or len(ordered) >= limit:
                 return
-            if key in taken_keys:
+            if key in taken:
                 continue
-            taken_keys.add(key)
-            ordered.append(page_entries[key][0])
+            taken.add(key)
+            ordered.append(key)
             count -= 1
 
-    def ranked_for(name: str) -> list[tuple[str, int]]:
-        _n, _quota, phrases, tokens = next(s for s in _SECTION_SIGNATURES if s[0] == name)
-        return sorted(
-            document_pages,
-            key=lambda key: (-_score_section(page_entries[key][1], phrases, tokens), key[0], key[1]),
-        )
-
     lowered = question.lower()
-    for name, quota, _phrases, _tokens in (s for s in _SECTION_SIGNATURES if s[0] in sections):
-        push(ranked_for(name), quota)
+    for name, quota, phrases, tokens in (s for s in _SECTION_SIGNATURES if s[0] in _section_plan(question)):
+        ranked = sorted(
+            document_pages,
+            key=lambda key: (
+                -_score_section(table.counts[key], set(table.tokens[key][:_HEAD_TOKENS]), phrases, tokens),
+                key[0],
+                key[1],
+            ),
+        )
+        push(ranked, quota)
         triggers = dict(_SECTION_TRIGGERS).get(name, ())
         if any(trigger in lowered for trigger in triggers):
-            push(ranked_for(name), 2)
-    stop = {
-        "what", "which", "who", "does", "did", "is", "are", "was", "were", "the", "a", "an",
-        "of", "in", "for", "to", "and", "or", "by", "as", "on", "at", "any", "its", "their",
-        "that", "this", "with", "from", "has", "have", "had", "how", "much", "many", "there",
-        "company", "fiscal", "year", "fy", "based", "per", "10k",
-    }
+            push(ranked, 2)
     question_words = {
-        word for word in _WORD.findall(question.lower()) if len(word) > 2 and word not in stop
+        stem
+        for stem in (_stem(word) for word in _WORD.findall(lowered))
+        if len(stem) > 2 and stem not in _STOP_WORDS and not stem.isdigit()
     }
+    # Raw counts let one repeated year on a table page outweigh every content
+    # word; the cap keeps the tail a question-overlap signal.
     ranked_question = sorted(
         document_pages,
-        key=lambda key: (-len(question_words & set(page_entries[key][1])), key[0], key[1]),
+        key=lambda key: (
+            -sum(min(table.counts[key].get(word, 0), _TAIL_TF_CAP) for word in question_words),
+            key[0],
+            key[1],
+        ),
     )
     push(ranked_question, max(0, limit - len(ordered)))
     return ordered
+
+
+def _pseudo_pages(
+    table: _PageTable,
+    probe: list[tuple[MemoryCitation, str, Counter]],
+    document_id: str,
+) -> list[tuple[str, int]]:
+    """Distinct pages behind the probe hits, target document's pages first."""
+
+    inside: list[tuple[str, int]] = []
+    outside: list[tuple[str, int]] = []
+    for citation, _document, _counts in probe:
+        key = table.entry_keys.get(citation.entry_id)
+        if key is None or key in inside or key in outside:
+            continue
+        if key[0] == document_id:
+            inside.append(key)
+        else:
+            outside.append(key)
+    return (inside + outside)[:4]
+
+
+def _weighted_question(
+    table: _PageTable,
+    idf: dict[str, float],
+    question: str,
+    question_terms: list[str],
+    pseudo_pages: list[tuple[str, int]],
+) -> dict[str, float]:
+    """Question terms plus two faithful expansions of the filing's own text.
+
+    Fiscal-year mentions ("FY2022") are normalized to the bare year that pages
+    actually print, and the pages the full-text probe did find contribute their
+    rare vocabulary: analyst concepts ("quick ratio", "customer concentration")
+    often never appear verbatim on the pages that answer them, but the probe's
+    own pages carry the filing's wording around the concept.
+    """
+
+    weighted = dict.fromkeys(question_terms, 1.0)
+    lowered = question.lower()
+    for year in re.findall(r"(?<!\d)((?:19|20)\d{2})(?!\d)", lowered):
+        if year not in weighted:
+            weighted[year] = 0.5
+    if pseudo_pages:
+        question_set = set(question_terms)
+        total = max(1, len(table.counts))
+        feedback: Counter[str] = Counter()
+        for key in pseudo_pages:
+            feedback.update(table.counts.get(key, ()))
+        ranked = sorted(
+            (
+                (tf * idf.get(term, 0.0), term)
+                for term, tf in feedback.items()
+                if term not in question_set
+                and len(term) > 2
+                and table.document_frequency(term) <= total // 4
+            ),
+            reverse=True,
+        )[:8]
+        for _score, term in ranked:
+            weighted[term] = 0.6
+    return weighted
+
+
+def _bm25(
+    counts: Counter,
+    length: int,
+    average_length: float,
+    idf: dict[str, float],
+    weighted_terms: dict[str, float],
+) -> float:
+    if length <= 0 or not weighted_terms:
+        return 0.0
+    k1, b = 1.2, 0.75
+    normalizer = k1 * (1 - b + b * length / max(1.0, average_length))
+    score = 0.0
+    for term, weight in weighted_terms.items():
+        tf = counts.get(term, 0)
+        if tf:
+            score += weight * idf.get(term, 0.0) * tf * (k1 + 1) / (tf + normalizer)
+    return score
+
+
+def _phrase_bonus(
+    tokens: list[str],
+    head_size: int,
+    question_terms: list[str],
+    idf: dict[str, float],
+) -> float:
+    """Reward pages where two consecutive question words also occur adjacently.
+
+    A page containing the query's exact word order ("net income", "cash flow")
+    is a far better answer candidate than the same words scattered apart, and a
+    match in the page's leading lines weighs double: statements, notes and
+    section openers carry their titles in their first lines.
+    """
+
+    if len(tokens) < 2 or len(question_terms) < 2:
+        return 0.0
+    bigrams = {
+        (question_terms[index], question_terms[index + 1])
+        for index in range(len(question_terms) - 1)
+    }
+    bonus = 0.0
+    for index in range(len(tokens) - 1):
+        pair = (tokens[index], tokens[index + 1])
+        if pair in bigrams:
+            weight = 1.0 if index < head_size - 1 else 0.5
+            bonus += weight * (idf.get(pair[0], 0.0) + idf.get(pair[1], 0.0))
+    return bonus
+
+
+def _bm25_ranked_keys(
+    table: _PageTable,
+    idf: dict[str, float],
+    document_id: str,
+    question: str,
+    question_terms: list[str],
+    probe: list[tuple[MemoryCitation, str, Counter]],
+    limit: int,
+) -> list[tuple[str, int]]:
+    """Statistical ranking of one filing's pages.
+
+    BM25 over stemmed page statistics with inverse document frequency from the
+    page population, adjacency bonuses for the query's word order, and feedback
+    terms from the probe's own pages. No hand-written vocabulary decides alone;
+    the section-signature ranking is fused with this one by the caller.
+    """
+
+    document_pages = sorted(key for key in table.counts if key[0] == document_id)
+    if not document_pages or not question_terms:
+        return []
+    lengths = {key: sum(table.counts[key].values()) for key in document_pages}
+    average_length = sum(lengths.values()) / len(document_pages)
+    weighted_terms = _weighted_question(
+        table, idf, question, question_terms, _pseudo_pages(table, probe, document_id)
+    )
+    raw = [
+        _bm25(table.counts[key], lengths[key], average_length, idf, weighted_terms)
+        + _phrase_bonus(table.tokens[key], _HEAD_TOKENS, question_terms, idf)
+        for key in document_pages
+    ]
+    # Evidence pages come in contiguous runs - a statement spans several pages,
+    # MD&A tables continue overleaf - so every page inherits part of the best
+    # score in its immediate neighborhood before the ranking is cut.
+    smoothed = [
+        0.65 * raw[index]
+        + 0.35 * max(raw[neighbor] for neighbor in range(max(0, index - 2), min(len(raw), index + 3)))
+        for index in range(len(raw))
+    ]
+    scored = sorted(
+        ((-smoothed[index], key[0], key[1]) for index, key in enumerate(document_pages)),
+    )
+    return [(key[1], key[2]) for key in scored[:limit]]
+
+
+def _fuse_rankings(*rankings: list[tuple[str, int]], limit: int) -> list[tuple[str, int]]:
+    """Reciprocal-rank fusion: pages that several independent rankings agree on
+    outrank pages that only one ranking put forward, and a page each ranking
+    missed by one signal can still be carried by the other."""
+
+    scores: dict[tuple[str, int], float] = {}
+    for ranking in rankings:
+        for rank, key in enumerate(ranking):
+            scores[key] = scores.get(key, 0.0) + 1.0 / (60 + rank)
+    return sorted(scores, key=lambda key: (-scores[key], key[0], key[1]))[:limit]
 
 
 async def _select_page_citations(
@@ -410,40 +632,49 @@ async def _select_page_citations(
     question: str,
     limit: int,
 ) -> list[MemoryCitation]:
-    """Anchor the target document, score its pages against section signatures,
-    and return distinct page citations in emission order."""
+    """Anchor the target document, fuse the section and statistical rankings,
+    and return distinct page citations in fused-rank order."""
 
-    seen: set[str] = set()
+    # 1. One public listing resolves every entry's page identity and the page-
+    #    grain term statistics for the whole capture.
+    listed = await memory.list(include_inactive=True)
+    table = _PageTable(listed)
+    idf = table.idf()
+
+    # 2. Question probe: the full-text ranking over entry parts anchors the
+    #    target document and supplies the feedback pages.
+    probe = await _sweep(memory, question, 32)
+    target_doc = _anchor_document(probe, question, table.document_names())
+    question_terms = _content_terms(question)
+
+    # 3. Two independent page rankings over the target filing, fused; both
+    #    rankings contribute their deeper lists, only the top ``limit`` pages
+    #    are emitted. The probe-order tail catches anything both rankings
+    #    could still have missed.
+    fused = _fuse_rankings(
+        _signature_ranked_keys(table, target_doc, question, 30),
+        _bm25_ranked_keys(table, idf, target_doc, question, question_terms, probe, 30),
+        limit=limit,
+    )
     emitted: list[MemoryCitation] = []
+    emitted_keys: set[tuple[str, int]] = set()
 
     def take(citation: MemoryCitation) -> None:
-        if citation.entry_id not in seen:
-            seen.add(citation.entry_id)
-            emitted.append(citation)
+        key = table.entry_keys.get(citation.entry_id)
+        if key is None or key in emitted_keys or len(emitted) >= limit:
+            return
+        emitted_keys.add(key)
+        emitted.append(citation)
 
-    # 1. One public listing resolves every entry's text and page sources: the
-    #    real document set and page-grain token counts for the whole filing.
-    listed = await memory.list(include_inactive=True)
-    page_entries = _collect_page_entries(listed)
-
-    # 2. Question probe: anchor the target document. Questions name their company
-    #    ("3M", "PepsiCo"), so match the document's company token as a whole word;
-    #    the raw bm25 winner alone can come from the wrong filing. Keep the
-    #    strongest direct match at the head of the result.
-    probe = await _sweep(memory, question, 16)
-    target_doc = _anchor_document(probe, question, {key[0] for key in page_entries})
-    if probe:
-        take(probe[0][0])
-
-    # 3. Section-signature ranking at page grain.
-    for citation in _rank_document_pages(page_entries, target_doc, question, limit):
-        take(citation)
-
-    # 4. Fill any remaining budget with deeper raw-question hits.
-    for citation, _document_id, _counts in probe:
+    for key in fused:
         if len(emitted) >= limit:
             break
-        take(citation)
+        take(table.citations[key])
+    for citation, document_id, _counts in probe:
+        if len(emitted) >= limit:
+            break
+        if document_id == target_doc:
+            take(citation)
     return emitted
 
 
