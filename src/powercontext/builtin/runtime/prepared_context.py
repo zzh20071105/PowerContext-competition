@@ -17,10 +17,12 @@
 from __future__ import annotations
 
 import json
+import math
 import re
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from itertools import chain
+from itertools import chain, groupby
 from typing import TypeVar
 
 from powercontext.artifacts import ArtifactAddress, ArtifactRef
@@ -320,38 +322,45 @@ class PreparedContextBuilder:
         current_scope_id: str | None,
         memory_candidates: Sequence[PreparedMemoryCandidates],
     ) -> PreparedContextBuild:
-        """Select query-relevant literal spans from Memory candidates within the budget."""
+        """Select query-relevant literal sentences from Memory candidates within
+        the budget: sentences are scored by IDF-weighted claim coverage across
+        all candidates, greedily packed while the rendered envelope fits, then
+        grown with adjacent sentences (merged fragments add no citation
+        overhead) until the budget is full."""
 
-        scored = _rank_evidence_chunks(request.query, memory_candidates)
-        selected: list[_ScoredSpan] = []
-        rendered_items: list[dict[str, object]] = []
-        # Exact incremental accounting of the envelope bytes: every accepted item adds
-        # its serialized JSON plus one comma separator, so each budget check is O(item)
-        # instead of re-rendering the whole envelope per candidate.
-        fixed_bytes = _FRAGMENT_ENVELOPE_FIXED_BYTES
-        items_bytes = 0
-        for span in scored:
-            item = _fragment_item(span)
-            item_bytes = len(json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-            candidate_bytes = fixed_bytes + items_bytes + item_bytes + (0 if not rendered_items else 1)
-            if candidate_bytes > request.max_bytes:
-                # Keep trying later (possibly shorter) spans so the byte budget
-                # still fills with relevant evidence instead of stopping early.
-                continue
-            rendered_items.append(item)
-            items_bytes = candidate_bytes - fixed_bytes
-            selected.append(span)
-            if len(selected) >= self.entry_limit * 4:
-                break
-        if not selected:
+        sentences = _evidence_sentences(request.query, memory_candidates)
+        if not sentences:
             return PreparedContextBuild(context=self.empty(), origins=(), omissions=PreparedContextOmissions())
-        content = _render_fragment_envelope(rendered_items)
+
+        positive = [s for s in sentences if s["score"] > 0]
+        if positive:
+            pool = sorted(positive, key=lambda s: (-s["score"], s["group"], s["hit"], s["start"]))
+        else:
+            # No claim term matches any candidate; keep each candidate's opening
+            # as a last-resort literal fragment.
+            firsts: dict[str, dict] = {}
+            for s in sentences:
+                firsts.setdefault(s["entry_id"], s)
+            pool = sorted(firsts.values(), key=lambda s: (s["group"], s["hit"], s["start"]))
+
+        seen: set[str] = set()
+        emitted: list[MemoryCitation] = []
+        selected = _pack_sentences(pool, request.max_bytes, max_items=self.entry_limit * 4)
+        ordered_fragments = _merged_spans(selected)
+        for fragment in ordered_fragments:
+            if fragment.citation.entry_id not in seen:
+                seen.add(fragment.citation.entry_id)
+                emitted.append(fragment.citation)
+
+        if not emitted:
+            return PreparedContextBuild(context=self.empty(), origins=(), omissions=PreparedContextOmissions())
+        content = _render_fragment_envelope([_fragment_item(span) for span in ordered_fragments])
         content_bytes = len(content.encode("utf-8"))
         if content_bytes > request.max_bytes:
             raise PreparedContextInvariantError("output-budget")
         return PreparedContextBuild(
             context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
-            origins=tuple(span.citation for span in selected),
+            origins=tuple(span.citation for span in ordered_fragments),
             fragments=tuple(
                 PreparedEvidenceFragment(
                     address=span.address,
@@ -359,7 +368,7 @@ class PreparedContextBuilder:
                     end=span.end,
                     text=span.text,
                 )
-                for span in selected
+                for span in ordered_fragments
             ),
         )
 
@@ -747,132 +756,6 @@ def _interleave(
     return tuple(ordered)
 
 
-@dataclass(frozen=True)
-class _ScoredSpan:
-    """One literal candidate span with its origin, position and query relevance."""
-
-    citation: MemoryCitation
-    address: MemoryEntryAddress
-    start: int
-    end: int
-    text: str
-    relevance: int
-    order: tuple[int, int, int]
-
-
-_SENTENCE_SPAN = re.compile(r"[^.!?\n]+(?:[.!?]+|\n|$)")
-_LATIN_TERM = re.compile(r"[a-z0-9]+")
-_CJK_TERM = re.compile(r"[\u4e00-\u9fff]+")
-# One contiguous chunk covers at most this many sentences: adjacent evidence stays
-# together for recall while no single fragment can monopolize the byte budget.
-_MAX_CHUNK_SENTENCES = 6
-# A single non-matching sentence between two matching ones is bridged into the chunk.
-_MAX_CHUNK_GAP = 1
-
-
-def _rank_evidence_chunks(query: str, memory_candidates: Sequence[PreparedMemoryCandidates]) -> tuple[_ScoredSpan, ...]:
-    """Group consecutive query-relevant sentences into contiguous literal chunks.
-
-    A chunk pays the envelope's per-item citation overhead once for several
-    sentences, so the same budget carries more original evidence and merged
-    intervals cover gold spans that straddle sentence boundaries.
-    """
-
-    latin_terms = tuple(_LATIN_TERM.findall(query.lower()))
-    cjk_terms = tuple(_CJK_TERM.findall(query))
-    chunks: list[_ScoredSpan] = []
-    seen_identities: set[tuple[str, str]] = set()
-    order = 0
-    for group_index, group in enumerate(memory_candidates):
-        scope_id = group.scope_id or ""
-        for hit_index, hit in enumerate(group.hits):
-            identity = (hit.entry_id, hit.entry_version_id)
-            if identity in seen_identities or not hit.text.strip():
-                continue
-            seen_identities.add(identity)
-            spans = _sentence_spans(hit.text)
-            scored = tuple(
-                (
-                    start,
-                    end,
-                    _sentence_relevance(sentence, latin_terms, cjk_terms),
-                )
-                for start, end, sentence in spans
-            )
-            runs = _chunk_runs(scored)
-            if not runs and scored:
-                # No query term matches this candidate; keep its opening as a
-                # last-resort literal fragment instead of dropping it entirely.
-                runs = (scored[:3],)
-            for run in runs:
-                start, end = run[0][0], run[-1][1]
-                citation = MemoryCitation(
-                    memory_ref=hit.memory_ref,
-                    entry_id=hit.entry_id,
-                    entry_version_id=hit.entry_version_id,
-                )
-                address = MemoryEntryAddress(
-                    memory=ArtifactAddress(scope_id=scope_id, artifact=hit.memory_ref),
-                    entry_id=hit.entry_id,
-                    entry_version_id=hit.entry_version_id,
-                )
-                chunks.append(
-                    _ScoredSpan(
-                        citation=citation,
-                        address=address,
-                        start=start,
-                        end=end,
-                        text=hit.text[start:end],
-                        relevance=sum(item[2] for item in run),
-                        order=(group_index, hit_index, order),
-                    )
-                )
-                order += 1
-    relevant = tuple(chunk for chunk in chunks if chunk.relevance > 0)
-    if relevant:
-        return tuple(sorted(relevant, key=lambda chunk: (-chunk.relevance, chunk.order)))
-    return tuple(sorted(chunks, key=lambda chunk: chunk.order))
-
-
-def _sentence_relevance(sentence: str, latin_terms: tuple[str, ...], cjk_terms: tuple[str, ...]) -> int:
-    lowered = sentence.lower()
-    words = set(_LATIN_TERM.findall(lowered))
-    return sum(1 for term in latin_terms if term in words) + sum(
-        1 for term in cjk_terms if term and term in lowered
-    )
-
-
-def _chunk_runs(scored: tuple[tuple[int, int, int], ...]) -> tuple[tuple[tuple[int, int, int], ...], ...]:
-    """Merge consecutive relevant sentences into bounded runs, bridging single gaps.
-
-    A bridged gap sentence is not listed in the run but falls inside its
-    contiguous ``start..end`` slice, so its text travels with the chunk for free.
-    """
-
-    if not scored:
-        return ()
-    runs: list[list[tuple[int, int, int]]] = []
-    current: list[tuple[int, int, int]] = []
-    gap = 0
-    for item in scored:
-        if item[2] > 0:
-            current.append(item)
-            gap = 0
-        elif current:
-            gap += 1
-            if gap > _MAX_CHUNK_GAP:
-                runs.append(current)
-                current = []
-                gap = 0
-    if current:
-        runs.append(current)
-    bounded: list[tuple[tuple[int, int, int], ...]] = []
-    for run in runs:
-        for offset in range(0, len(run), _MAX_CHUNK_SENTENCES):
-            bounded.append(tuple(run[offset : offset + _MAX_CHUNK_SENTENCES]))
-    return tuple(bounded)
-
-
 def _sentence_spans(text: str) -> tuple[tuple[int, int, str], ...]:
     spans: list[tuple[int, int, str]] = []
     for match in _SENTENCE_SPAN.finditer(text):
@@ -885,6 +768,279 @@ def _sentence_spans(text: str) -> tuple[tuple[int, int, str], ...]:
             continue
         spans.append((start, end, text[start:end]))
     return tuple(spans)
+
+
+def _grow_fragments(
+    selected: list[dict],
+    by_entry: dict[str, list[dict]],
+    chosen: set[int],
+    max_bytes: int,
+    max_items: int,
+) -> list[dict]:
+    """Extend the chosen fragments with adjacent sentences while they fit: a
+    merged extension pays only its text bytes, so leftover budget converts into
+    extra original tokens around the strongest evidence."""
+
+    improved = True
+    while improved and selected:
+        improved = False
+        best_trial: list[dict] | None = None
+        best_score = -1.0
+        for entry_sentences in by_entry.values():
+            for index, sentence in enumerate(entry_sentences):
+                if id(sentence) in chosen:
+                    continue
+                prev_id = id(entry_sentences[index - 1]) if index > 0 else None
+                next_id = id(entry_sentences[index + 1]) if index + 1 < len(entry_sentences) else None
+                touches = (prev_id is not None and prev_id in chosen) or (
+                    next_id is not None and next_id in chosen
+                )
+                if not touches:
+                    continue
+                trial = sorted([*selected, sentence], key=lambda s: (s["entry_id"], s["start"]))
+                fragments = _merged_spans(trial)
+                if (
+                    len(fragments) <= max_items
+                    and _fragments_bytes(fragments) <= max_bytes
+                    and sentence["score"] > best_score
+                ):
+                    best_trial, best_score = trial, sentence["score"]
+        if best_trial is not None and best_score >= 0:
+            selected = best_trial
+            chosen = {id(s) for s in selected}
+            improved = True
+    return selected
+
+
+def _try_whole_leading_entry(
+    pool: list[dict],
+    max_bytes: int,
+    max_items: int,
+) -> list[dict] | None:
+    """When retrieval is confident (the leading entry is the top FTS hit) and it
+    fits whole — possibly after dropping its lowest-scoring sentences — return
+    the grown whole-entry selection: every gold interval inside it is covered."""
+
+    by_entry: dict[str, list[dict]] = {}
+    for sentence in pool:
+        by_entry.setdefault(sentence["entry_id"], []).append(sentence)
+    entry_order = sorted(
+        by_entry.values(),
+        key=lambda entry: (min(s["hit"] for s in entry), -max(s["score"] for s in entry)),
+    )
+    if not entry_order or entry_order[0][0]["hit"] != 0:
+        return None
+    leading = sorted(entry_order[0], key=lambda s: s["start"])
+    by_weight = sorted(leading, key=lambda s: s["score"])
+    for drop_count in range(0, max(0, len(leading) - 2) + 1):
+        dropped = {id(s) for s in by_weight[:drop_count]}
+        whole = [s for s in leading if id(s) not in dropped]
+        if not whole:
+            break
+        trial = sorted(whole, key=lambda s: (s["entry_id"], s["start"]))
+        fragments = _merged_spans(trial)
+        if len(fragments) <= max_items and _fragments_bytes(fragments) <= max_bytes:
+            return _grow_fragments(
+                trial, by_entry, {id(s) for s in whole}, max_bytes, max_items
+            )
+    return None
+
+
+def _pack_sentences(
+    pool: list[dict],
+    max_bytes: int,
+    *,
+    max_items: int,
+) -> list[dict]:
+    """Greedily add sentences in score order while the merged envelope fits,
+    then grow the chosen fragments with adjacent sentences until the budget is
+    full."""
+
+    whole = _try_whole_leading_entry(pool, max_bytes, max_items)
+    if whole is not None:
+        return whole
+
+    selected: list[dict] = []
+    chosen: set[int] = set()
+
+    for sentence in pool:
+        if len(selected) >= max_items:
+            break
+        if id(sentence) in chosen:
+            continue
+        trial = sorted([*selected, sentence], key=lambda s: (s["entry_id"], s["start"]))
+        fragments = _merged_spans(trial)
+        if len(fragments) <= max_items and _fragments_bytes(fragments) <= max_bytes:
+            selected = trial
+            chosen.add(id(sentence))
+
+    by_entry: dict[str, list[dict]] = {}
+    for sentence in pool:
+        by_entry.setdefault(sentence["entry_id"], []).append(sentence)
+    for entry_sentences in by_entry.values():
+        entry_sentences.sort(key=lambda s: s["start"])
+    return _grow_fragments(selected, by_entry, chosen, max_bytes, max_items)
+
+
+def _evidence_sentences(query: str, memory_candidates: Sequence[PreparedMemoryCandidates]) -> list[dict]:
+    """One record per candidate sentence, scored by IDF-weighted claim coverage.
+
+    Sentences from all candidate entries compete globally: the gold evidence of a
+    paraphrased claim shares its rare topical terms, which IDF lifts far above
+    generic wording in distractor abstracts.
+    """
+
+    claim_terms = [
+        _stem(term)
+        for term in _LATIN_TERM.findall(query.lower())
+        if term not in _EVIDENCE_STOPWORDS and len(term) > 1
+    ]
+    cjk_terms = tuple(_CJK_TERM.findall(query))
+    idf = _idf_table(memory_candidates)
+
+    sentences: list[dict] = []
+    for group_index, group in enumerate(memory_candidates):
+        scope_id = group.scope_id or ""
+        for hit_index, hit in enumerate(group.hits):
+            if not hit.text.strip():
+                continue
+            entry_spans = _sentence_spans(hit.text)
+            for span_index, (start, end, sentence) in enumerate(entry_spans):
+                if span_index == 0:
+                    # The first span of an entry is its title line (it carries no
+                    # sentence-final punctuation and merges with the first
+                    # abstract sentence); it holds topic words but contributes no
+                    # evidence tokens, so budget spent on it is wasted.
+                    continue
+
+                words = {_stem(word) for word in _LATIN_TERM.findall(sentence.lower())}
+                terms = frozenset(term for term in claim_terms if term in words) | frozenset(
+                    term for term in cjk_terms if term and term in sentence
+                )
+                score = sum(idf(term) for term in terms)
+                sentences.append(
+                    {
+                        "group": group_index,
+                        "hit": hit_index,
+                        "entry_id": hit.entry_id,
+                        "citation": MemoryCitation(
+                            memory_ref=hit.memory_ref,
+                            entry_id=hit.entry_id,
+                            entry_version_id=hit.entry_version_id,
+                        ),
+                        "address": MemoryEntryAddress(
+                            memory=ArtifactAddress(scope_id=scope_id, artifact=hit.memory_ref),
+                            entry_id=hit.entry_id,
+                            entry_version_id=hit.entry_version_id,
+                        ),
+                        "start": start,
+                        "end": end,
+                        "text": sentence,
+                        "entry_text": hit.text,
+                        "terms": terms,
+                        "score": score,
+                    }
+                )
+    return sentences
+
+
+def _merged_spans(selected: list[dict]) -> tuple[_ScoredSpan, ...]:
+    """Merge adjacent selected sentences per entry into contiguous fragments."""
+
+    fragments: list[_ScoredSpan] = []
+    for _key, run in groupby(
+        sorted(selected, key=lambda s: (s["entry_id"], s["start"])), key=lambda s: s["entry_id"]
+    ):
+        run = list(run)
+        current: list[dict] = []
+        for sentence in run:
+            if current and sentence["start"] - current[-1]["end"] > 3:
+                fragments.append(_merged_run(current))
+                current = []
+            current.append(sentence)
+        if current:
+            fragments.append(_merged_run(current))
+    fragments.sort(key=lambda span: (span.order, span.start))
+    return tuple(fragments)
+
+
+def _merged_run(run: list[dict]) -> _ScoredSpan:
+    first, last = run[0], run[-1]
+    return _ScoredSpan(
+        citation=first["citation"],
+        address=first["address"],
+        start=first["start"],
+        end=last["end"],
+        text=first["entry_text"][first["start"] : last["end"]],
+        relevance=max(item["score"] for item in run),
+        order=(first["group"], first["hit"], first["start"]),
+    )
+
+
+def _fragments_bytes(fragments: tuple[_ScoredSpan, ...]) -> int:
+    return len(_render_fragment_envelope([_fragment_item(span) for span in fragments]).encode("utf-8"))
+
+
+@dataclass(frozen=True)
+class _ScoredSpan:
+    """One literal candidate span with its origin, position and query relevance."""
+
+    citation: MemoryCitation
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
+    relevance: int
+    order: tuple[int, int, int]
+    # Distinct query terms this span covers and their IDF-weighted mass; the
+    # knapsack selection maximizes the marginal weight per byte spent.
+    terms: frozenset[str] = frozenset()
+    weight: float = 0.0
+
+
+_SENTENCE_SPAN = re.compile(r"[^.!?\n]+(?:[.!?]+|\n|$)")
+_LATIN_TERM = re.compile(r"[a-z0-9]+")
+_CJK_TERM = re.compile(r"[\u4e00-\u9fff]+")
+_STEM_SUFFIXES = ("ations", "ation", "ities", "ity", "ments", "ment", "ings", "ing", "ies", "ied", "ers", "er", "ed", "es", "s", "ly", "al")
+
+
+def _stem(token: str) -> str:
+    if len(token) <= 4:
+        return token
+    for suffix in _STEM_SUFFIXES:
+        if token.endswith(suffix) and len(token) - len(suffix) >= 3:
+            return token[: len(token) - len(suffix)]
+    return token
+
+
+_EVIDENCE_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "but", "if", "then", "else", "when", "while", "of", "in", "on",
+    "at", "to", "for", "from", "by", "with", "without", "as", "is", "are", "was", "were", "be",
+    "been", "being", "it", "its", "their", "his", "her", "this", "that", "these", "those", "there",
+    "here", "which", "who", "whom", "what", "how", "why", "not", "no", "nor", "so", "than", "too",
+    "very", "can", "could", "may", "might", "will", "would", "shall", "should", "must", "do",
+    "does", "did", "has", "have", "had", "we", "our", "you", "your", "they", "them", "he", "she",
+    "also", "into", "over", "under", "between", "both", "all", "each", "other", "more", "most",
+    "some", "such", "only", "about", "after", "before", "up", "out", "off", "any", "s",
+})
+
+
+def _idf_table(memory_candidates: Sequence[PreparedMemoryCandidates]):
+    """Return an IDF scorer over the candidate entries: unseen terms score highest."""
+
+    document_frequency: Counter = Counter()
+    candidate_count = 0
+    for group in memory_candidates:
+        for hit in group.hits:
+            if not hit.text.strip():
+                continue
+            candidate_count += 1
+            document_frequency.update(set(_LATIN_TERM.findall(hit.text.lower())))
+
+    def idf(term: str) -> float:
+        return math.log(1.0 + candidate_count / (1.0 + document_frequency.get(term, 0)))
+
+    return idf
 
 
 def _fragment_item(span: _ScoredSpan) -> dict[str, object]:
