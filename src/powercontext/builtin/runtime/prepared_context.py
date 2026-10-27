@@ -322,7 +322,7 @@ class PreparedContextBuilder:
     ) -> PreparedContextBuild:
         """Select query-relevant literal spans from Memory candidates within the budget."""
 
-        scored = _rank_evidence_spans(request.query, memory_candidates)
+        scored = _rank_evidence_chunks(request.query, memory_candidates)
         selected: list[_ScoredSpan] = []
         rendered_items: list[dict[str, object]] = []
         # Exact incremental accounting of the envelope bytes: every accepted item adds
@@ -763,12 +763,24 @@ class _ScoredSpan:
 _SENTENCE_SPAN = re.compile(r"[^.!?\n]+(?:[.!?]+|\n|$)")
 _LATIN_TERM = re.compile(r"[a-z0-9]+")
 _CJK_TERM = re.compile(r"[\u4e00-\u9fff]+")
+# One contiguous chunk covers at most this many sentences: adjacent evidence stays
+# together for recall while no single fragment can monopolize the byte budget.
+_MAX_CHUNK_SENTENCES = 6
+# A single non-matching sentence between two matching ones is bridged into the chunk.
+_MAX_CHUNK_GAP = 1
 
 
-def _rank_evidence_spans(query: str, memory_candidates: Sequence[PreparedMemoryCandidates]) -> tuple[_ScoredSpan, ...]:
+def _rank_evidence_chunks(query: str, memory_candidates: Sequence[PreparedMemoryCandidates]) -> tuple[_ScoredSpan, ...]:
+    """Group consecutive query-relevant sentences into contiguous literal chunks.
+
+    A chunk pays the envelope's per-item citation overhead once for several
+    sentences, so the same budget carries more original evidence and merged
+    intervals cover gold spans that straddle sentence boundaries.
+    """
+
     latin_terms = tuple(_LATIN_TERM.findall(query.lower()))
     cjk_terms = tuple(_CJK_TERM.findall(query))
-    spans: list[_ScoredSpan] = []
+    chunks: list[_ScoredSpan] = []
     seen_identities: set[tuple[str, str]] = set()
     order = 0
     for group_index, group in enumerate(memory_candidates):
@@ -778,12 +790,22 @@ def _rank_evidence_spans(query: str, memory_candidates: Sequence[PreparedMemoryC
             if identity in seen_identities or not hit.text.strip():
                 continue
             seen_identities.add(identity)
-            for start, end, sentence in _sentence_spans(hit.text):
-                lowered = sentence.lower()
-                words = set(_LATIN_TERM.findall(lowered))
-                relevance = sum(1 for term in latin_terms if term in words) + sum(
-                    1 for term in cjk_terms if term and term in lowered
+            spans = _sentence_spans(hit.text)
+            scored = tuple(
+                (
+                    start,
+                    end,
+                    _sentence_relevance(sentence, latin_terms, cjk_terms),
                 )
+                for start, end, sentence in spans
+            )
+            runs = _chunk_runs(scored)
+            if not runs and scored:
+                # No query term matches this candidate; keep its opening as a
+                # last-resort literal fragment instead of dropping it entirely.
+                runs = (scored[:3],)
+            for run in runs:
+                start, end = run[0][0], run[-1][1]
                 citation = MemoryCitation(
                     memory_ref=hit.memory_ref,
                     entry_id=hit.entry_id,
@@ -794,23 +816,61 @@ def _rank_evidence_spans(query: str, memory_candidates: Sequence[PreparedMemoryC
                     entry_id=hit.entry_id,
                     entry_version_id=hit.entry_version_id,
                 )
-                spans.append(
+                chunks.append(
                     _ScoredSpan(
                         citation=citation,
                         address=address,
                         start=start,
                         end=end,
-                        text=sentence,
-                        relevance=relevance,
+                        text=hit.text[start:end],
+                        relevance=sum(item[2] for item in run),
                         order=(group_index, hit_index, order),
                     )
                 )
                 order += 1
-    relevant = tuple(span for span in spans if span.relevance > 0)
+    relevant = tuple(chunk for chunk in chunks if chunk.relevance > 0)
     if relevant:
-        return tuple(sorted(relevant, key=lambda span: (-span.relevance, span.order)))
-    leading = tuple(span for span in spans if span.order[2] < 2 * len(memory_candidates) * 2)
-    return tuple(sorted(leading, key=lambda span: span.order))
+        return tuple(sorted(relevant, key=lambda chunk: (-chunk.relevance, chunk.order)))
+    return tuple(sorted(chunks, key=lambda chunk: chunk.order))
+
+
+def _sentence_relevance(sentence: str, latin_terms: tuple[str, ...], cjk_terms: tuple[str, ...]) -> int:
+    lowered = sentence.lower()
+    words = set(_LATIN_TERM.findall(lowered))
+    return sum(1 for term in latin_terms if term in words) + sum(
+        1 for term in cjk_terms if term and term in lowered
+    )
+
+
+def _chunk_runs(scored: tuple[tuple[int, int, int], ...]) -> tuple[tuple[tuple[int, int, int], ...], ...]:
+    """Merge consecutive relevant sentences into bounded runs, bridging single gaps.
+
+    A bridged gap sentence is not listed in the run but falls inside its
+    contiguous ``start..end`` slice, so its text travels with the chunk for free.
+    """
+
+    if not scored:
+        return ()
+    runs: list[list[tuple[int, int, int]]] = []
+    current: list[tuple[int, int, int]] = []
+    gap = 0
+    for item in scored:
+        if item[2] > 0:
+            current.append(item)
+            gap = 0
+        elif current:
+            gap += 1
+            if gap > _MAX_CHUNK_GAP:
+                runs.append(current)
+                current = []
+                gap = 0
+    if current:
+        runs.append(current)
+    bounded: list[tuple[tuple[int, int, int], ...]] = []
+    for run in runs:
+        for offset in range(0, len(run), _MAX_CHUNK_SENTENCES):
+            bounded.append(tuple(run[offset : offset + _MAX_CHUNK_SENTENCES]))
+    return tuple(bounded)
 
 
 def _sentence_spans(text: str) -> tuple[tuple[int, int, str], ...]:

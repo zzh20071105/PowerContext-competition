@@ -108,7 +108,9 @@ def _visible_chain(
     while current is not None:
         chain.append(current)
         parent_id = current.get("parentId")
-        current = records[parent_id] if isinstance(parent_id, str) and parent_id else None
+        # A parent equal to the session header id is a legal root link validated
+        # earlier; the chain terminates there like an empty parent reference.
+        current = records.get(parent_id) if isinstance(parent_id, str) and parent_id else None
     return tuple(
         event
         for event in (_visible_event(header["id"], record) for record in reversed(chain))

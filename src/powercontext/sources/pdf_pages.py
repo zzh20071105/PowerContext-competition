@@ -176,8 +176,11 @@ async def search_pdf_pages(
         raise ValueError(message)
     citations: list[MemoryCitation] = []
     seen_sources: set[str] = set()
-    # Fetch twice the budget so source-level deduplication can still fill it.
-    page = await memory.search(SearchMemoryRequest(query=question, mode="fts", limit=limit * 2))
+    # The fixed pipeline may split one page into several Memory entries; fetch a
+    # wide candidate window so source-level deduplication can still return the
+    # full budget of distinct pages.
+    fetch_limit = min(limit * 4, 100)
+    page = await memory.search(SearchMemoryRequest(query=question, mode="fts", limit=fetch_limit))
     for hit in page.hits:
         citation = MemoryCitation(
             memory_ref=hit.memory_ref,
